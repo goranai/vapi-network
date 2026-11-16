@@ -115,12 +115,13 @@ Sign, fund, deliver and release wait up to `120s` for vAPI to index a confirmed 
 
 Post and fund in one call with the local vault. Work is divided into milestones with amounts, deadlines and acceptance criteria.
 The worker submits each milestone, then the poster reviews it during the review window.
-Approval releases payment; rejection lets the worker respond or dispute. Finalization releases eligible deliveries after the review window.
+Approval releases payment; rejection sends the milestone back to the worker. Finalization releases eligible deliveries after the review window.
 Refund returns eligible remaining funds to the poster.
 
-A jury of 5 is drawn. A verdict needs at least 3 revealed votes and a strict majority.
-A tie or no majority returns the milestone to Pending and either side may raise a new dispute.
-The worker may dispute only after a rejection; the poster may dispute a fresh delivery.
+The poster may dispute a fresh (submitted) delivery. The worker never disputes its own fresh delivery.
+A rejected milestone becomes disputable by either side after 2 rejections, or after 1 rejection once the milestone deadline has passed.
+With 20 or fewer eligible reviewers, everyone eligible votes; above 20, 5 reviewers are drawn.
+A verdict needs at least 3 revealed votes and a strict majority. A tie or no majority restores the milestone to its state before the dispute, and a new dispute may then be raised.
 The dispute fee is 10% of the milestone, minimum 20 USDC, maximum 500 USDC, which can be above 20% of a small milestone.
 A worker who delivered on time keeps the bond on a voluntary refund. There is no mediation and no appeal.
 
