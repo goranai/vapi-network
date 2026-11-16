@@ -1,16 +1,21 @@
 # Task commands
 
-Tasks is coming soon on production. It is an onchain task market with USDC escrow, delivery, review and disputes. The commands below require a preview server with Tasks enabled.
+Tasks is an onchain task market with USDC escrow, delivery, review and disputes. The commands below require a server with Tasks enabled.
 
 The task SDK in `@vapi-network/core/tasks` talks to the vAPI task API and builds delivery manifests. The CLI verbs below use its shared actions. The local MCP server exposes the same task verbs.
 
 | Verb                | What it does                                                                 | Moves money            |
 | ------------------- | ---------------------------------------------------------------------------- | ---------------------- |
 | `search`            | Finds tasks and workers.                                                     | No                     |
-| `show`              | Shows a task and its public receipt.                                         | No                     |
-| `post`              | Posts a task or open bounty.                                                 | No                     |
+| `show`              | Shows lifecycle, milestones, next action and receipts.                       | No                     |
+| `pending`           | Lists the acting wallet's pending actions.                                   | No                     |
+| `checkin`           | Records a worker check-in.                                                   | No                     |
+| `post`              | Posts a task, bounty or pool, optionally funding with the vault.             | Only with `--fund`     |
 | `propose`           | Proposes terms for a task.                                                   | No                     |
 | `submit`            | Submits proof for an open bounty.                                            | No                     |
+| `milestone`         | Submit, approve, reject or finalize a zero-based V2 milestone                | On approve/finalize    |
+| `cancel`            | Cancel a V2 offer, unpaid remainder or expire                                | Refunds only           |
+| `claim`             | Pay a stored pool claim as its verifier                                      | Yes                    |
 | `award`             | Awards a proposal or submission.                                             | No                     |
 | `sign`              | Signs the task scope.                                                        | No                     |
 | `fund`              | Locks USDC in escrow.                                                        | Yes                    |
@@ -25,7 +30,7 @@ The task SDK in `@vapi-network/core/tasks` talks to the vAPI task API and builds
 | `watch`             | Watches task events and moves money only when auto-release is on.            | Only with auto-release |
 | `status`            | Shows signed-in chain state and participant events, or the public task card. | No                     |
 
-This table is copied from the vAPI public API reference; change both tables together.
+The local CLI and MCP share these verbs. Hosted API availability can lag the local tools; unsupported operations report the server error without claiming success.
 
 ## CLI
 
@@ -34,9 +39,11 @@ Every implemented command accepts `--json`. Most commands, including delivery, w
 ```sh
 vapi task search [--open] [--min <usd>] [--tab trending|new|closing|paid] [--limit <n>]
 vapi task show <id> [--account <name>]
-vapi task post --title <text> --brief <file|-> --amount <usd> --deadline <duration|ISO> [--intake proposals|submissions] [--max-awards <k>] [--webhook <https-url>] [--account <name>]
+vapi task pending [--account <name>]
+vapi task checkin <id> --status on-track|blocked|need-input [--note <text>] [--link <url>] [--account <name>]
+vapi task post --title <text> --brief <file|-> --deadline <duration|ISO> [--shape task|bounty|pool] [--amount <usd>] [--milestone "amount|acceptance|deadline"...] [--proof <preset>[:mustContain]...] [--checkin none|6h|24h|72h|7d] [--winners <n> --reward-per-winner <usd> --choice-window <sec>] [--reward-per-claim <usd> --budget <usd> --gate open|proven --verifier poster|vapi --open-check allowlist|invite] [--fund] [--yes] [--no-wait] [--timeout 120s] [--intake proposals|submissions] [--max-awards <k>] [--webhook <https-url>] [--account <name>]
 vapi task propose <id> --price <usd> --duration <duration> --note <text> [--account <name>]
-vapi task submit <id> --proof <https-url> [--proof <https-url>...] [--file <path>...] [--account <name>]
+vapi task submit <id> [--proof <https-url>...] [--file <path>...] [--withdraw] [--proposal-id <id>] [--account <name>]
 vapi task award <id> <proposalId> [--account <name>]
 vapi task sign <id> [--yes] [--no-wait] [--timeout 120s] [--counterparty <0x…>] [--account <name>] [--json]
 vapi task fund <id> [--yes] [--no-wait] [--timeout 120s] [--counterparty <0x…>] [--account <name>] [--json]
@@ -57,13 +64,13 @@ Durations accept `5s`, `10m`, `48h`, `7d`, or an ISO-8601 timestamp. Posting req
 
 Hosted `tasks.confirm` completes signing intents and advances chain operations. It is separate from the local CLI verbs documented above.
 
-Posting a task moves no money. The fee line shows gross · fee · net using the deployed `feeBp`; an absent fee shows “fee unavailable”. The CLI stores amount, deadline, intake and max awards in the order market metadata, then configures an optional webhook through the order webhook endpoint.
+Posting a task without `--fund` moves no money. The fee line shows gross · fee · net using the deployed `feeBp`; an absent fee shows “fee unavailable”. The CLI stores amount, deadline, intake and max awards in the order market metadata, then configures an optional webhook through the order webhook endpoint.
 
 Search applies `--open` and `--min` to the returned board page, including the pinned task. Tab and limit are sent to the board. Thread `--after` accepts the previous page's `nextBeforeSeq`. The SDK supports backward pagination through `beforeSeq`, so this reads older messages.
 
 Show uses the authenticated task route when a bearer exists; otherwise it reads the public card. Status reads chain state and participant events when signed in, or the public card without sign-in. Public cards define `receiptUrl`, which is printed as supplied by the server. Private task milestones have `escrowContract` but no receipt URL field; settled milestones get `<origin>/receipts/<escrowContract>`, labeled as derived from escrow in human output and `receiptUrlSource: "escrow"` in JSON. All settled milestones remain listed in `receipts`.
 
-A preview server with Tasks enabled provides public search, status, submissions, events and participant routes. OAuth reads require `tasks:read`; writes require `tasks:write`, which also grants read access. Proposals and submissions locally sign the exact canonical JSON payload.
+A server with Tasks enabled provides public search, status, submissions, events and participant routes. OAuth reads require `tasks:read`; writes require `tasks:write`, which also grants read access. Proposals and submissions locally sign the exact canonical JSON payload.
 
 Scope acceptance is signed by the local vault account and requires `tasks:write`. Worker acceptance may create an unfunded escrow with the same local signer. Fund, deliver, release, refund, dispute, counter-evidence, resolve-unmatched and watch auto-release submit their transactions from the selected local vault wallet. Base Sepolia reads `BASE_SEPOLIA_RPC_URL` and defaults to `https://sepolia.base.org`. It trusts escrow factory `0x6Ba83621eb386B3E093032096251cA504F6ee033`. Configure another chain, or override that pin, with `VAPI_TASKS_ESCROW_FACTORY_<chainId>`. Chains without a trusted factory are rejected before signing.
 
@@ -89,7 +96,7 @@ Fund, release, refund and resolve-unmatched print gross · fee · net from the d
 
 Delivery accepts 1 to 20 regular files. `--files` may name several paths and may be repeated; directories and other non-regular paths are invalid usage. After upload finalization supplies each file's ID, name, SHA-256 and size, the CLI hashes the note and canonical manifest with the shared manifest algorithm before chain execution. Dispute and counter-evidence accept only an already prepared `0x`-prefixed 64-hex-character evidence hash. The evidence-file hashing format has not been decided, so the CLI does not infer one.
 
-Watch polls `events(id, { after: cursor, wait: 0 })`, advances its cursor and ignores duplicate events. `--interval` defaults to `5s` and must be at least one second; `--timeout` defaults to `7d` and must be positive. `--until` accepts `open`, `awarded`, `funded`, `delivered`, `paid`, `released`, `refunded`, `disputed`, `expired`, `closed`, `completed` or `cancelled`. With `--auto-release`, an amount strictly below `autoReleaseBelowUsd` is released automatically only while the current milestone remains delivered with submitted escrow; historical delivery events for settled or disputed milestones are ignored. An amount at or above that threshold requires interactive approval or exits `3` in non-interactive mode.
+Watch polls `events(id, { after: cursor, wait: 0 })`, advances its cursor and ignores duplicate events. `--interval` defaults to `5s` and must be at least one second; `--timeout` defaults to `7d` and must be positive. `--until` accepts `open`, `awarded`, `funded`, `delivered`, `paid`, `released`, `refunded`, `disputed`, `expired`, `closed`, `completed` `cancelled`, `checkin`, `stalled`, `claimed`, `judging` or `milestone`. With `--auto-release`, an amount strictly below `autoReleaseBelowUsd` is released automatically only while the current milestone remains delivered with submitted escrow; historical delivery events for settled or disputed milestones are ignored. An amount at or above that threshold requires interactive approval or exits `3` in non-interactive mode.
 
 A route this server does not offer reports `<verb> is not available on this server yet.` with code `not_available` and exit `1`. A `403` with `insufficient_scope` asks you to run `vapi login` again. An explicit missing task remains a missing-task error.
 
@@ -104,6 +111,88 @@ At exit `1`, invalid usage has JSON `{ok:false,error:{code:"usage_error",message
 
 Sign, fund, deliver and release wait up to `120s` for vAPI to index a confirmed transaction. `--no-wait` skips polling, while `--timeout` changes the limit. An indexing timeout prints a status command and keeps exit code `0` because the transaction succeeded.
 
+## Tasks v2 (Base Sepolia beta)
+
+Post and fund in one call with the local vault. Work is divided into milestones with amounts, deadlines and acceptance criteria.
+The worker submits each milestone, then the poster reviews it during the review window.
+Approval releases payment; rejection lets the worker respond or dispute. Finalization releases eligible deliveries after the review window.
+Refund returns eligible remaining funds to the poster.
+
+A jury of 5 is drawn. A verdict needs at least 3 revealed votes and a strict majority.
+A tie or no majority returns the milestone to Pending and either side may raise a new dispute.
+The worker may dispute only after a rejection; the poster may dispute a fresh delivery.
+The dispute fee is 10% of the milestone, minimum 20 USDC, maximum 500 USDC, which can be above 20% of a small milestone.
+A worker who delivered on time keeps the bond on a voluntary refund. There is no mediation and no appeal.
+
+The CLI verbs and matching local MCP tools are listed in [MCP](#mcp).
+Use `milestone` for submit, approve, reject and finalize; use `dispute`, `counter-evidence` and `resolve-unmatched` for disputes.
+The participant commands do not include jury voting commands.
+
+Base Sepolia uses chain 84532. The placeholders below are filled after the Sepolia deploy.
+The pin map remains empty, so these operator overrides are required before signing. This is a command template, not a verified live run.
+
+```sh
+export VAPI_TASKS_V2_ESCROW_FACTORY_84532='<ESCROW_FACTORY_V2>'
+export VAPI_TASKS_V2_DISPUTE_RESOLVER_V3_84532='<DISPUTE_RESOLVER_V3>'
+export VAPI_TASKS_V2_POOL_FACTORY_84532='<BOUNTY_POOL_FACTORY_V1>'
+export VAPI_TASKS_V2_USDC_84532='<USDC>'
+export VAPI_TASKS_V2_USDC_NAME_84532='USD Coin'
+export VAPI_TASKS_V2_USDC_VERSION_84532=2
+vapi task post --title "Research shortlist" --brief brief.md --amount 100 --deadline 7d \
+  --shape task --milestone "30|Shortlist approved|3d" \
+  --milestone "70|Intros completed|7d" --fund --yes
+```
+
+Confirm the deployed token domain before setting its name and version. In Conductor cloud environments, prefix these input names with `VAPI_NETWORK_`.
+The one-call flow depends on the server returning a supported funding preparation; the limitations below still apply.
+
+```sh
+# One worker, two milestones; amounts sum to the budget.
+vapi task post --title "Research shortlist" --brief brief.md --amount 100 --deadline 7d \
+  --shape task --milestone "30|Shortlist approved|3d" \
+  --milestone "70|Intros completed|7d" --proof link --checkin 24h
+
+# Three winners, 25 USDC each. The total escrow budget is 75 USDC.
+vapi task post --title "Record the demo" --brief brief.md --deadline 3d \
+  --shape bounty --winners 3 --reward-per-winner 25 --choice-window 604800 \
+  --proof x-post:vAPI --proof media
+
+# Each verified claim earns 5 USDC from a 100 USDC budget.
+vapi task post --title "Try the demo" --brief brief.md --deadline 7d \
+  --shape pool --reward-per-claim 5 --budget 100 --gate proven --verifier poster
+
+vapi task checkin <id> --status blocked --note "Waiting for access" --link https://example.com/proof
+vapi task pending --json
+vapi task submit <id> --withdraw
+```
+
+`--shape` defaults to `task`. Legacy `--intake submissions` remains supported when no v2 shape is supplied. A task accepts one to five `--milestone` values; each deadline accepts a duration or ISO timestamp and must be at least ten minutes away. If `--amount` is omitted, milestone amounts determine the task budget. Bounties default to one winner and a seven-day choice window. Pools default to `--gate proven --verifier poster`; an open pool also requires `--open-check allowlist|invite`. Membership is configured separately on the hosted service.
+
+Proof presets are `link`, `file`, `x-post`, `onchain-tx`, `pr`, `text` and `media`, with up to six requirements. The optional `:mustContain` suffix applies to `link`, `x-post` and `pr`; additional colons stay in the required text. `media` shorthand accepts both photo and video. SDK and MCP callers can use the full `proofSpec` envelope and native `milestones`, `bounty` and `pool` base-unit fields.
+
+The HTTP SDK remains in `@vapi-network/core/tasks`. For the hosted canonical views and one-call preparation, SDK code uses `createHostedTasksClient` from `@vapi-network/mcp` (also available as `mcp.createHostedTasksClient` in `vapi-network`). The adapter returns unsigned intents; it never signs:
+
+```ts
+import { createHostedTasksClient } from "@vapi-network/mcp";
+
+const tasks = createHostedTasksClient({ baseUrl, token });
+const shown = await tasks.show(taskId);
+console.log(shown.lifecycle, shown.nextAction);
+const pending = await tasks.pending();
+```
+
+Check-ins accept `on-track`, `blocked` and `need-input`. The hosted API requires a note, so when `--note` is omitted the CLI uses the status with spaces, such as `on track`. Check-in links are recorded as HTTP(S) references. `pending` prints one action per line with its amount, due time and deep link. Withdrawal needs no signature: the CLI selects the acting wallet's single active submission, or accepts `--proposal-id` explicitly. Proof and file options cannot be combined with withdrawal.
+
+Signed-in `show` reads the hosted canonical lifecycle and next action; JSON preserves `lifecycle` and `nextAction`. Human output includes declared milestone amounts, acceptance text, deadlines and state, followed by a next-action line. These reads and `post --fund` use the hosted MCP read/preparation transport with the same device-link bearer; `vapi login` grants `mcp:call` along with the Tasks scopes. No authorization is signed on the hosted service.
+
+`post --fund` posts once and uses the returned existing deposit intent with the local vault. It checks `maxPerTaskUsd`, the wallet's daily cap and `approveAboveUsd` before reserving spend or signing. `--yes` grants threshold approval and cannot override caps. The existing `maxPerTaskUsd` and `autoReleaseBelowUsd` profile fields are preserved; this change adds no new release automation. A returned intent must match the verified local escrow, signer, amount, token domain, type and deadline. The same scope binding and onchain verification as `task fund` apply.
+
+The T7 hosted implementation returns the created task plus `funding.error` for fresh posts until create-and-fund is available: `funding_requires_accepted_scope`, `bounty_funding_not_available_yet` or `pool_funding_not_available_yet`. CLI JSON retains both the task and that error and exits `1`; local MCP returns the same error with the task. No success is invented for unsupported funding. The existing task path remains award → sign → worker creates escrow → fund.
+
+`task fund` first probes `GET /v1/tasks/:id/fund`. A standard x402 `exact` challenge uses the same local payment implementation as Call, checks its network, USDC asset, destination and amount against the task, and applies task and daily spend policy. Local scope and escrow verification still apply. A missing challenge route keeps the existing signed deposit-intent path. Both protocols share a locked funding-attempt journal under the vault's `tasks/` directory. Before signing, it records the protocol, verified coordinates, amount, nonce and authorization expiry. An unresolved attempt blocks both protocols, including when a later challenge probe returns 404. A hosted funded observation retires the attempt without releasing accounted spend. An expired authorization can be released only after the trusted RPC returns `authorizationState(poster, nonce) = false`; a failed or ambiguous RPC read keeps it blocked. A signer failure that produces no authorization releases its reservation and permits retry. x402 funding is tested with recorded responses; the live T26 route has not been verified.
+
+Both funding paths poll the hosted escrow state unless `--no-wait` is supplied. They print `escrow funded` only after a hosted funded observation. `--no-wait` and an indexing timeout retain a pending result; payment acknowledgement alone is insufficient. `watch` also understands `task.checkin`, `task.stalled`, `task.claimed`, `task.judging`, `task.milestone` and `task.released`. Judging prints `deadline passed, N submissions, pick winners`; event JSON retains the original payload.
+
 ## MCP
 
 The CLI and MCP share the same policy and core functions. Each CLI verb maps to a local MCP tool:
@@ -112,9 +201,14 @@ The CLI and MCP share the same policy and core functions. Each CLI verb maps to 
 | ------------------- | ------------------------- |
 | `search`            | `tasks.search`            |
 | `show`              | `tasks.show`              |
+| `pending`           | `tasks.pending`           |
+| `checkin`           | `tasks.checkin`           |
 | `post`              | `tasks.post`              |
 | `propose`           | `tasks.propose`           |
 | `submit`            | `tasks.submit`            |
+| `milestone`         | `tasks.milestone`         |
+| `cancel`            | `tasks.cancel`            |
+| `claim`             | `tasks.claim`             |
 | `award`             | `tasks.award`             |
 | `sign`              | `tasks.sign`              |
 | `fund`              | `tasks.fund`              |
@@ -136,3 +230,140 @@ vapi task fund <id>
 ```
 
 Approval never bypasses a cap. Per-task and per-day refusals return `ok:false` with `reason` set to `policy.perTask` or `policy.perDay` without touching the spend ledger. MCP watch performs one bounded poll of at most 25 seconds and never releases escrow. See the [MCP tool reference](mcp.md#tools) for inputs, results, wallet linking and server limits.
+
+## V2 participant writes
+
+Hosted V2 writes are off by default. No deployed V2 tuple or live write has been
+verified for these commands. Wire contracts follow vapi-app `tasks-v1`, PR #490
+(T11) and integration PR #493. V1 proposal awards, scope signing and escrow
+operations keep their existing path when the hosted API selects V1.
+
+```sh
+vapi task milestone <id> --index 0 submit --proof https://example.com/delivery
+vapi task milestone <id> --index 0 submit --file ./delivery.txt --note "Ready for review"
+vapi task milestone <id> --index 0 approve
+vapi task milestone <id> --index 0 reject --reason "Include the requested proof"
+vapi task milestone <id> --index 0 finalize
+vapi task cancel <id> offer
+vapi task cancel <id> remainder
+vapi task cancel <id> expire
+vapi task sign <id> --action award-consent
+vapi task award <id> --worker 0x...
+vapi task award <id> --winners 0x...,0x...
+vapi task sign <id> --action split-consent --index 0 --to-worker 12000000
+vapi task dispute <id> --action split --index 0 --to-worker 12000000
+vapi task fund <id>
+vapi task refund <id>
+vapi task dispute <id> --index 0 --evidence "Evidence text"
+vapi task counter-evidence <id> --index 0 --evidence "Counter-evidence text"
+vapi task resolve-unmatched <id> --index 0
+vapi task claim <id> --claimant 0x...
+vapi task status <id> --operation <uuid> --step v2-fund --recover
+vapi task status <id> --operation <uuid> --step v2-fund --abandon
+```
+
+Action indices are **zero-based C0 indices (0–4)**. Posted milestone declarations
+remain one-based. `--to-worker` takes exact USDC base units (six decimals), not
+USD. Milestone submission accepts repeated HTTPS `--proof` and local `--file`
+arguments as submission does; `--proof-json <file>` accepts the hosted preset
+ProofFill array for text, media, PR and onchain transaction proofs. Rejection
+requires a reason. A bounty award sends the entire winners list in one
+`awardBounty` plan. Pool `claim --claimant` pays an existing signed claim as the
+pool verifier; claim admission is separate.
+
+The worker signs `award-consent` before the poster awards the task. A negotiated
+split requires the other party's `split-consent` with the same index and amount.
+The CLI and SDK sign the exact EIP-712 data returned by the API, confirm that
+signature with the API, and follow its returned transaction plans. They construct
+no calldata. The existing vault stores and signs locally. Before any funding or
+dispute fee signature, the CLI checks `maxPerTaskUsd`, approval thresholds and
+the daily cap, then reserves the amount the wallet pays with `reserveSpend`.
+Escrow payouts do not charge that amount again. MCP cannot grant human approval;
+the CLI accepts `--yes` under the existing policy rules.
+
+Human output shows gross · fee · net before signing. JSON stdout contains one
+result; the money line goes to stderr and the result includes `money`,
+`lifecycle`, `nextAction`, and the operation ID/state. For running orders the fee
+comes from the hosted immutable V2 snapshot. Missing required money data refuses
+the action. Stable hosted errors such as `v2_writes_disabled`,
+`chain_preflight_unavailable`, `v2_binding_mismatch`,
+`v2_funding_snapshot_unavailable` and `v1_order` retain their codes.
+
+Approval, pool creation and action steps run in sequence. A failed step stops the
+sequence. Signed transaction bytes and preparation keys persist in the local
+pending journal; retrying the original command resumes its hosted operation.
+The CLI and SDK poll order-level confirm/reconcile and recover responses without
+requiring a milestone row, and reports completion only after hosted confirmation.
+V2 always waits for that confirmation, including when legacy `--no-wait` was
+supplied. Bounded polling returns `operation_pending` if it cannot confirm; it
+never prints a completion line on that path. `status --operation --step` resumes
+hosted recovery scans; a prepared result means rerun the original action to sign
+the remaining plan. Abandon scans until the API permits abandonment or returns a
+recovered operation. It never clears local signed bytes or spend reservations.
+
+The corresponding local tools are `tasks.milestone {id,action,i,proof?,reason?}`,
+`tasks.cancel {id,scope}`, `tasks.award {id,worker|winners}`,
+`tasks.sign {id,action,i?,toWorker?}`, `tasks.claim {id,action:"pay",claimant}`,
+and the existing money tools with V2 indices/evidence where applicable.
+`tasks.status {id,operationId,step,abandon?}` handles journal recovery. All tools
+have plain top-level object schemas. The SDK exposes `prepareV2`, `signV2`,
+`confirmV2Signature`, `operationV2`, `executeTaskV2` and `recoverTaskV2`; custom
+legacy transport and signing adapters can keep the original interface.
+
+V2 signing also requires a **local deployment trust anchor**. The V2 pin map is
+empty until the control room verifies the deployment ceremony. Hosted readiness,
+intent recipients and operation destinations cannot supply that trust. With no
+pin or explicit override the command returns `v2_trust_unavailable` before a
+signature. For staging, configure all six chain-specific variables, for example:
+
+```sh
+VAPI_TASKS_V2_ESCROW_FACTORY_84532=0x...
+VAPI_TASKS_V2_DISPUTE_RESOLVER_V3_84532=0x...
+VAPI_TASKS_V2_POOL_FACTORY_84532=0x...
+VAPI_TASKS_V2_USDC_84532=0x...
+VAPI_TASKS_V2_USDC_NAME_84532='USD Coin'
+VAPI_TASKS_V2_USDC_VERSION_84532=2
+```
+
+Cloud inputs use the `VAPI_NETWORK_` prefix. Every override is logged to stderr as
+“untrusted override”; SDK callers can supply `trustedV2Deployments` and
+`onV2UntrustedOverride` in the chain options. Factory membership, poster, token,
+amounts and on-chain terms are checked through the configured RPC. Every
+registered-target action must match the order's accepted terms hash and the
+pinned factory's prediction with that order's salt. The acting wallet must hold
+the on-chain role required by the action; award consent comes from the prospective
+worker before assignment. The money confirmation preview includes the verified
+escrow address.
+
+Fresh approval-first funding predicts the recipient from accepted order terms
+and local defaults before approving the pinned factory. The later creation step
+must use exactly those inputs. An accepted bounty choice window takes precedence
+over local defaults. Unset offer TTL and choice windows default to 604800 seconds;
+staging can explicitly set
+`VAPI_TASKS_V2_OFFER_TTL_SECONDS_<chainId>` and
+`VAPI_TASKS_V2_CHOICE_WINDOW_SECONDS_<chainId>`, or the SDK pin's
+`offerTtlSeconds` and `choiceWindowSeconds`. The optional
+`VAPI_TASKS_V2_EVIDENCE_WINDOW_SECONDS_<chainId>` (SDK `evidenceWindowSeconds`)
+also accepts a positive safe integer; it records local evidence-window configuration. The review window uses the existing
+local trusted duration setting. These are local decisions, never hosted
+readiness values. Creation plans must match accepted terms and the pinned
+factory's prediction. A hosted
+signature intent lacks the frozen creation arguments needed to verify an
+undeployed recipient, so that authorization is refused until the recipient can
+be independently verified. Pool funding also requires its on-chain verifier to
+be the accepted poster; an independently trusted delegated checker is not yet
+configured. Funding authorizations require the exact pinned USDC
+domain and schema, a 32-byte nonce and a chain-clock validity window of at most
+one hour.
+
+Every transaction selector, destination and requested index/amount is checked
+before signing. C0 task creation funding approves only the pinned escrow factory;
+pool funding and dispute fees approve only the verified clone, for the exact
+amount paid. Unmatched settlement requires a verified disputed milestone,
+resolver state, elapsed evidence window and opener event before its money
+preview. Voluntary refunds include pending and submitted milestones; cancelling
+an unpaid remainder includes pending milestones only.
+
+Post-with-funding persists its original unsigned operation or intent and
+idempotency key before an approval refusal. `task fund <id> --yes` resumes that
+preparation without creating a conflicting hosted operation.

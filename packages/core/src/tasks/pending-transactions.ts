@@ -14,6 +14,8 @@ import {
   type ReconcileOperationResponse,
 } from "./types.js";
 
+import { taskV2PreparedSchema, type TaskV2Prepared, taskV2StepSchema } from "./v2-write.js";
+
 export type PendingTransaction = {
   chainId: number;
   txHash: Hex;
@@ -30,7 +32,12 @@ export type RetainedSpendReservation = {
   exposed?: boolean;
   invalidated?: boolean;
 };
-export type PendingPreparation = { idempotencyKey: string; inputs: unknown; operationId?: string };
+export type PendingPreparation = {
+  idempotencyKey: string;
+  inputs: unknown;
+  operationId?: string;
+  preparedV2?: TaskV2Prepared;
+};
 
 export interface PendingTransactions {
   get(operationId: string, step: string): Promise<PendingTransaction | undefined>;
@@ -44,9 +51,11 @@ export interface PendingTransactions {
   markExposure(milestoneId: string): Promise<void>;
   preparation(milestoneId: string, verb: string): Promise<PendingPreparation | undefined>;
   putPreparation(milestoneId: string, verb: string, preparation: PendingPreparation): Promise<void>;
+  bindPreparedV2?(milestoneId: string, verb: string, prepared: TaskV2Prepared): Promise<void>;
   bindPreparationOperation(milestoneId: string, verb: string, operationId: string): Promise<void>;
   completePreparation(milestoneId: string, verb: string): Promise<void>;
   reservationId(escrowId: string, generate: () => string): Promise<string>;
+  clearExpiredFunding?(escrowId: string, reservationId: string): Promise<void>;
   existingReservationId?(escrowId: string): Promise<string | undefined>;
   retainedReservation?(escrowId: string): Promise<RetainedSpendReservation | undefined>;
   bindReservation?(escrowId: string, reservation: RetainedSpendReservation): Promise<void>;
@@ -75,19 +84,22 @@ const hash = z
   .string()
   .regex(/^0x[0-9a-fA-F]{64}$/)
   .transform((v) => v as Hex);
-const step = z.enum([
-  "create-escrow",
-  "approve-usdc",
-  "deposit-funds",
-  "fund-with-authorization",
-  "submit-delivery",
-  "release-funds",
-  "refund-buyer",
-  "raise-dispute",
-  "submit-counter-evidence",
-  "resolve-unmatched-dispute",
-  "timeout-refund",
-  "finalize",
+const step = z.union([
+  taskV2StepSchema,
+  z.enum([
+    "create-escrow",
+    "approve-usdc",
+    "deposit-funds",
+    "fund-with-authorization",
+    "submit-delivery",
+    "release-funds",
+    "refund-buyer",
+    "raise-dispute",
+    "submit-counter-evidence",
+    "resolve-unmatched-dispute",
+    "timeout-refund",
+    "finalize",
+  ]),
 ]);
 const operationStepKey = z.string().refine((key) => {
   const separator = key.indexOf(":");
@@ -152,6 +164,7 @@ const stateSchema = z
             idempotencyKey: z.uuid(),
             inputs: z.unknown(),
             operationId: z.uuid().optional(),
+            preparedV2: taskV2PreparedSchema.optional(),
           })
           .strict(),
       )
@@ -304,6 +317,19 @@ export function createPendingTransactions(home: string): PendingTransactions {
       }
       return highest + 1;
     },
+    async clearExpiredFunding(milestoneId, reservationId) {
+      await locked(async (state) => {
+        milestoneKey(milestoneId);
+        if (state.reservations[milestoneId] && state.reservations[milestoneId] !== reservationId)
+          throw new Error("A different reservation owns the expired funding attempt.");
+        delete state.authorizations[milestoneId];
+        delete state.exposures[milestoneId];
+        delete state.reservations[milestoneId];
+        delete state.retainedReservations[milestoneId];
+        delete state.preparations[preparationKey(milestoneId, "fund")];
+        await save(state);
+      });
+    },
     async exposure(milestoneId) {
       milestoneKey(milestoneId);
       const state = await read();
@@ -333,6 +359,7 @@ export function createPendingTransactions(home: string): PendingTransactions {
             idempotencyKey: z.uuid(),
             inputs: z.unknown(),
             operationId: z.uuid().optional(),
+            preparedV2: taskV2PreparedSchema.optional(),
           })
           .strict()
           .parse(preparation);
@@ -347,6 +374,19 @@ export function createPendingTransactions(home: string): PendingTransactions {
           state.preparations[key] = parsed;
           await save(state);
         }
+      });
+    },
+    async bindPreparedV2(milestoneId, verb, prepared) {
+      await locked(async (state) => {
+        const key = preparationKey(milestoneId, verb);
+        const existing = state.preparations[key];
+        if (!existing)
+          throw new Error("A durable preparation is required before binding a V2 response.");
+        const parsed = taskV2PreparedSchema.parse(prepared);
+        if (existing.preparedV2 && canonicalJson(existing.preparedV2) !== canonicalJson(parsed))
+          throw new Error("The original V2 preparation response is immutable.");
+        existing.preparedV2 = parsed;
+        await save(state);
       });
     },
     async bindPreparationOperation(milestoneId, verb, operationId) {

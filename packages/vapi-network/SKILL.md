@@ -160,3 +160,9 @@ jq '.payment' eth.json
 5. **Never pay twice for one request.** After `settlement_unknown` or a lost response, run `vapi pay --resume <receipt-id>` first.
 6. **Surface cap blocks.** Name the cap and the quote; the user decides whether to raise it.
 7. **Keep secrets out of the conversation.** Never ask for, print or store a recovery phrase, passphrase or private key. `vapi backup` and `vapi export-key` are for the user's own terminal.
+
+## Tasks
+
+Use `vapi task --help` for task verbs, including `post --fund`, `milestone`, `dispute` and `refund`.
+MCP exposes the matching `tasks.*` tools, including `tasks.post`, `tasks.milestone`, `tasks.dispute` and `tasks.refund`.
+Read [docs/tasks.md](https://github.com/vAPI-Network/vapi-network/blob/tasks-v1/docs/tasks.md) for the full verb/tool table, Base Sepolia beta rules, deployment overrides and recovery.

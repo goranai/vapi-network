@@ -10,10 +10,12 @@ import {
   spendCapsForWallet,
 } from "@vapi-network/core";
 import {
+  executeTaskV2,
+  taskUsesV2,
+  taskV2PreparedSchema,
   autoReleaseDecision,
   awardTask,
   cachedMoneyClient,
-  createTasksClient,
   createScopeBindings,
   createPendingTransactions,
   createTasksChain,
@@ -23,6 +25,8 @@ import {
   counterEvidenceTaskOperation,
   resolveUnmatchedTaskOperation,
   fundTaskOperation,
+  fundTaskWithX402,
+  requireTaskMethod,
   formatBaseUnitsUsd,
   messageTask,
   missingTasksChain,
@@ -30,6 +34,11 @@ import {
   parseTaskDuration as parseCoreTaskDuration,
   parseUsdToBaseUnits,
   postTask,
+  prepareTaskPost,
+  parseTaskMilestone,
+  parseTaskProof,
+  checkinInputSchema,
+  taskEventLine,
   proposeTask,
   publicNotFoundFetch,
   readTaskFile as readCoreTaskFile,
@@ -70,7 +79,7 @@ import {
   type SignedScopeTerms,
   validTaskBrief,
 } from "@vapi-network/core/tasks";
-import { registeredAgentProfileSchema } from "@vapi-network/mcp";
+import { createHostedTasksClient, registeredAgentProfileSchema } from "@vapi-network/mcp";
 import {
   getEnvironment,
   getLinePrompt,
@@ -85,6 +94,8 @@ import {
   type WalletTarget,
 } from "./cli.js";
 
+import { taskV2Command } from "./task-v2.js";
+
 export type TasksCommandDependencies = {
   client?: TasksClient | ((options: TasksClientOptions) => TasksClient);
   chain?: TasksChain;
@@ -95,27 +106,32 @@ export type TasksCommandDependencies = {
 export const TASK_HELP = `Usage:
   vapi task search [--open] [--min <usd>] [--tab trending|new|closing|paid] [--limit <n>] [--json]
   vapi task show <id> [--account <name>] [--json]
-  vapi task post --title <text> --brief <file|-> --amount <usd> --deadline <duration|ISO> [--intake proposals|submissions] [--max-awards <k>] [--webhook <https-url>] [--account <name>] [--json]
+  vapi task pending [--account <name>] [--json]
+  vapi task checkin <id> --status on-track|blocked|need-input [--note <text>] [--link <url>] [--account <name>] [--json]
+  vapi task post --title <text> --brief <file|-> --deadline <duration|ISO> [--shape task|bounty|pool] [--amount <usd>] [--milestone "amount|acceptance|deadline"...] [--proof <preset>[:mustContain]...] [--checkin none|6h|24h|72h|7d] [--winners <n> --reward-per-winner <usd> --choice-window <sec>] [--reward-per-claim <usd> --budget <usd> --gate open|proven --verifier poster|vapi --open-check allowlist|invite] [--fund] [--yes] [--no-wait] [--timeout 120s] [--intake proposals|submissions] [--max-awards <k>] [--webhook <https-url>] [--account <name>] [--json]
   vapi task propose <id> --price <usd> --duration <duration> --note <text> [--account <name>] [--json]
-  vapi task submit <id> --proof <https-url> [--proof <https-url>...] [--file <path>...] [--account <name>] [--json]
-  vapi task award <id> <proposalId> [--account <name>] [--json]
-  vapi task sign <id> [--yes] [--no-wait] [--timeout 120s] [--counterparty <0x…>] [--account <name>] [--json]
+  vapi task submit <id> [--proof <https-url>...] [--file <path>...] [--withdraw] [--proposal-id <id>] [--account <name>] [--json]
+  vapi task milestone <id> --index N submit|approve|reject|finalize [--proof <https-url>...] [--file <path>...] [--proof-json <file>] [--note <text>] [--reason <text>] [--json]
+  vapi task cancel <id> offer|remainder|expire [--json]
+  vapi task claim <id> --claimant <addr> [--json]
+  vapi task award <id> [<proposalId>|--worker <addr>|--winners a,b,c] [--account <name>] [--json]
+  vapi task sign <id> [--action award-consent|split-consent --index N --to-worker <base-units>] [--yes] [--no-wait] [--timeout 120s] [--counterparty <0x…>] [--account <name>] [--json]
   vapi task fund <id> [--yes] [--no-wait] [--timeout 120s] [--counterparty <0x…>] [--account <name>] [--json]
   vapi task deliver <id> --files <path...> --note <text> [--no-wait] [--timeout 120s] [--counterparty <0x…>] [--account <name>] [--json]
   vapi task release <id> [--no-wait] [--timeout 120s] [--counterparty <0x…>] [--account <name>] [--json]
   vapi task refund <id> [--counterparty <0x…>] [--account <name>] [--json]
-  vapi task dispute <id> --evidence-hash <0x + 64 hex> [--yes] [--counterparty <0x…>] [--account <name>] [--json]
-  vapi task counter-evidence <id> --evidence-hash <0x + 64 hex> [--yes] [--counterparty <0x…>] [--account <name>] [--json]
-  vapi task resolve-unmatched <id> [--counterparty <0x…>] [--account <name>] [--json]
+  vapi task dispute <id> [--evidence-hash <0x + 64 hex>|--index N --evidence <text>] [--action raise|resolve-unmatched|split --to-worker <base-units>] [--yes] [--counterparty <0x…>] [--account <name>] [--json]
+  vapi task counter-evidence <id> [--evidence-hash <0x + 64 hex>|--index N --evidence <text>] [--yes] [--counterparty <0x…>] [--account <name>] [--json]
+  vapi task resolve-unmatched <id> [--index N] [--counterparty <0x…>] [--account <name>] [--json]
   vapi task message <id> <text> [--account <name>] [--json]
   vapi task thread <id> [--after <cursor>] [--account <name>] [--json]
   vapi task watch <id> [--until <state>] [--auto-release] [--timeout 7d] [--interval 5s] [--counterparty <0x…>] [--account <name>] [--json]
-  vapi task status <id> [--account <name>] [--json]
+  vapi task status <id> [--operation <uuid> --step <v2-step> --recover|--abandon] [--account <name>] [--json]
 
 Durations: 5s, 10m, 48h, 7d, or an ISO-8601 timestamp. Posting and proposal terms require at least 10 minutes.
-Dispute accepts a precomputed evidence hash only; evidence-file hashing is still undecided upstream.
+V1 dispute accepts a precomputed evidence hash. V2 dispute accepts --index with --evidence text. C0 action indices are zero-based; declared milestone indices remain one-based.
 Watch requires an interval of at least 1s and a positive timeout. Auto-release uses the acting wallet's agent profile, or defaults, and releases only amounts strictly below the threshold.
-Posting a task moves no money. Task reads require tasks:read and writes require tasks:write; write access includes reads.
+Posting without --fund moves no money. --fund applies task and daily caps before signing. Task reads require tasks:read and writes require tasks:write; write access includes reads.
 The thread cursor is the previous page's nextBeforeSeq; --after reads older messages using beforeSeq.
 Every command accepts --json. Watch and a partially completed sign may write more than one JSON value. Human diagnostics go to stderr.
 
@@ -138,6 +154,7 @@ export class TaskCommandError extends Error {
     message: string,
     readonly manifestHash?: `0x${string}`,
     readonly prefixCode = false,
+    readonly details?: Record<string, unknown>,
   ) {
     super(message);
     this.name = "TaskCommandError";
@@ -147,7 +164,7 @@ export class TaskCommandError extends Error {
 function mapTaskError(error: unknown): unknown {
   if (error instanceof TaskInputError) return new UsageError(error.message);
   if (error instanceof TaskOperationError)
-    return new TaskCommandError(error.code, error.message, error.manifestHash, true);
+    return new TaskCommandError(error.code, error.message, error.manifestHash, true, error.details);
   return error;
 }
 
@@ -215,6 +232,12 @@ function lazyTasksChain(
   }
   return {
     available: true,
+    executeV2: async (input) => {
+      const initialized = await get();
+      if (!initialized.executeV2)
+        throw new TaskOperationError("chain_unavailable", "V2 signing is unavailable.");
+      return initialized.executeV2(input);
+    },
     ...(signingAddress === undefined ? {} : { signingAddress }),
     getSigningAddress: async () => {
       const initialized = await get();
@@ -228,6 +251,22 @@ function lazyTasksChain(
       return address;
     },
     createEscrow: async (input) => (await get()).createEscrow(input),
+    validateFunding: async (input) => {
+      const initialized = await get();
+      if (!initialized.validateFunding)
+        throw new TasksChainError("Local funding verification is unavailable.", false, {
+          authorizationExposed: false,
+        });
+      return initialized.validateFunding(input);
+    },
+    fundingAuthorizationState: async (input) => {
+      const initialized = await get();
+      if (!initialized.fundingAuthorizationState)
+        throw new TasksChainError("Authorization state verification is unavailable.", false, {
+          authorizationExposed: false,
+        });
+      return initialized.fundingAuthorizationState(input);
+    },
     fund: async (input) => {
       let initialized: TasksChain;
       try {
@@ -305,7 +344,9 @@ export async function taskContext(
   };
   const injected = dependencies.tasks?.client;
   const client =
-    typeof injected === "function" ? injected(options) : (injected ?? createTasksClient(options));
+    typeof injected === "function"
+      ? injected(options)
+      : (injected ?? createHostedTasksClient(options));
   const pending = createPendingTransactions(getVapiPaths().directory);
   const chain =
     dependencies.tasks?.chain ??
@@ -318,6 +359,8 @@ export async function taskContext(
               client,
               account,
               trustedFactories: config.tasksEscrowFactoryOverrides,
+              env,
+              onV2UntrustedOverride: io.stderr,
               trustedDurations: config.tasksEscrowDurationOverrides,
               bindings: createScopeBindings(getVapiPaths().directory),
               rpcFor: createTasksRpcFor(config, {
@@ -423,6 +466,17 @@ async function taskCommandInner(
   const parsed = parseArguments(commandArguments, {
     valueOptions: new Set([
       "--wallet",
+      ...(["milestone", "dispute", "counter-evidence", "resolve-unmatched", "sign"].includes(verb!)
+        ? ["--index"]
+        : []),
+      ...(verb === "milestone"
+        ? ["--reason", "--proof", "--file", "--files", "--note", "--proof-json"]
+        : []),
+      ...(verb === "award" ? ["--worker", "--winners"] : []),
+      ...(["sign", "dispute"].includes(verb!) ? ["--action", "--to-worker"] : []),
+      ...(["dispute", "counter-evidence"].includes(verb!) ? ["--evidence"] : []),
+      ...(verb === "claim" ? ["--claimant"] : []),
+      ...(verb === "status" ? ["--operation", "--step"] : []),
       ...([
         "sign",
         "fund",
@@ -447,39 +501,67 @@ async function taskCommandInner(
               "--intake",
               "--max-awards",
               "--webhook",
+              "--shape",
+              "--milestone",
+              "--proof",
+              "--checkin",
+              "--winners",
+              "--reward-per-winner",
+              "--choice-window",
+              "--reward-per-claim",
+              "--budget",
+              "--gate",
+              "--verifier",
+              "--open-check",
+              "--timeout",
             ]
-          : verb === "propose"
-            ? ["--price", "--duration", "--note"]
-            : verb === "submit"
-              ? ["--proof", "--file"]
-              : verb === "thread"
-                ? ["--after"]
-                : verb === "deliver"
-                  ? ["--files", "--note"]
-                  : ["dispute", "counter-evidence"].includes(verb!)
-                    ? ["--evidence-hash"]
-                    : verb === "watch"
-                      ? ["--until", "--timeout", "--interval"]
-                      : []),
+          : verb === "checkin"
+            ? ["--status", "--note", "--link"]
+            : verb === "propose"
+              ? ["--price", "--duration", "--note"]
+              : verb === "submit"
+                ? ["--proof", "--file", "--proposal-id"]
+                : verb === "thread"
+                  ? ["--after"]
+                  : verb === "deliver"
+                    ? ["--files", "--note"]
+                    : ["dispute", "counter-evidence"].includes(verb!)
+                      ? ["--evidence-hash"]
+                      : verb === "watch"
+                        ? ["--until", "--timeout", "--interval"]
+                        : []),
       ...(["sign", "fund", "deliver", "release"].includes(verb!) ? ["--timeout"] : []),
     ]),
     booleanOptions: new Set([
       ...(verb === "search" ? ["--open"] : []),
+      ...(verb === "status" ? ["--abandon", "--recover"] : []),
+      ...(verb === "release" ? ["--finalize"] : []),
+      ...(["milestone", "cancel", "award", "claim"].includes(verb!) ? ["--yes"] : []),
+      ...(verb === "post" ? ["--fund", "--yes", "--no-wait"] : []),
+      ...(verb === "submit" ? ["--withdraw"] : []),
       ...(["sign", "fund", "dispute", "counter-evidence"].includes(verb!) ? ["--yes"] : []),
       ...(["sign", "fund", "deliver", "release"].includes(verb!) ? ["--no-wait"] : []),
       ...(verb === "watch" ? ["--auto-release"] : []),
     ]),
     repeatableOptions: new Set([
-      ...(verb === "submit" ? ["--proof", "--file"] : []),
+      ...(["submit", "milestone"].includes(verb!) ? ["--proof", "--file"] : []),
+      ...(verb === "milestone" ? ["--files"] : []),
       ...(verb === "deliver" ? ["--files"] : []),
+      ...(verb === "post" ? ["--milestone", "--proof"] : []),
     ]),
-    maximumPositionals: ["search", "post"].includes(verb!)
+    maximumPositionals: ["search", "post", "pending"].includes(verb!)
       ? 0
-      : ["award", "message"].includes(verb!)
+      : ["award", "message", "milestone", "cancel"].includes(verb!)
         ? 2
         : 1,
   });
-  const id = ["search", "post"].includes(verb!) ? undefined : taskId(parsed.positionals[0]);
+  const id = ["search", "post", "pending"].includes(verb!)
+    ? undefined
+    : taskId(parsed.positionals[0]);
+  if (id !== undefined) {
+    const v2 = await taskV2Command(verb!, id, parsed, json, io, dependencies);
+    if (v2 !== null) return v2;
+  }
   if (
     [
       "sign",
@@ -521,12 +603,42 @@ async function taskCommandInner(
     return;
   }
   if (verb === "post") {
+    if (parsed.has("--fund") && parseTaskDuration(parsed.one("--timeout") ?? "120s", now) <= 0)
+      throw new UsageError("--timeout must be positive.");
     const title = required(parsed, "--title"),
       briefPath = required(parsed, "--brief");
-    const amount = usd(required(parsed, "--amount"), "--amount");
-    const duration = parseTaskDuration(required(parsed, "--deadline"), now);
-    if (duration < TASK_LIMITS.postDeadlineMinMs)
-      throw new UsageError("--deadline must be at least 10 minutes from now.");
+    const prepared = prepareTaskPost(
+      {
+        shape: enumOption(parsed.one("--shape"), ["task", "bounty", "pool"], "--shape"),
+        amountUsd: parsed.one("--amount"),
+        deadline: required(parsed, "--deadline"),
+        ...(parsed.many("--milestone").length
+          ? {
+              milestones: parsed
+                .many("--milestone")
+                .map((value, index) => parseTaskMilestone(value, index + 1, now)),
+            }
+          : {}),
+        ...(parsed.many("--proof").length
+          ? { proofSpec: parsed.many("--proof").map(parseTaskProof) }
+          : {}),
+        checkin: enumOption(
+          parsed.one("--checkin"),
+          ["none", "6h", "24h", "72h", "7d"],
+          "--checkin",
+        ),
+        winners: optionalInteger(parsed.one("--winners"), "--winners"),
+        rewardPerWinner: parsed.one("--reward-per-winner"),
+        choiceWindowSeconds: optionalInteger(parsed.one("--choice-window"), "--choice-window"),
+        rewardPerClaim: parsed.one("--reward-per-claim"),
+        budget: parsed.one("--budget"),
+        gate: enumOption(parsed.one("--gate"), ["open", "proven"], "--gate"),
+        verifier: enumOption(parsed.one("--verifier"), ["poster", "vapi"], "--verifier"),
+        openCheck: enumOption(parsed.one("--open-check"), ["allowlist", "invite"], "--open-check"),
+      },
+      now,
+    );
+    const { amount, deadlineAt } = prepared;
     const intake = parsed.one("--intake");
     if (intake !== undefined && !["proposals", "submissions"].includes(intake))
       throw new UsageError("--intake must be proposals or submissions.");
@@ -542,6 +654,12 @@ async function taskCommandInner(
       title: title.trim(),
       description: brief.trim(),
       policyFamily: "general-digital",
+      ...(parsed.one("--shape") !== undefined ||
+      parsed.many("--milestone").length ||
+      parsed.many("--proof").length ||
+      parsed.one("--checkin") !== undefined
+        ? prepared.terms
+        : {}),
     };
     if (!validTaskBrief(input.title, input.description))
       throw new UsageError(
@@ -552,12 +670,141 @@ async function taskCommandInner(
     const outcome = await postTask(context, {
       order: input,
       amount,
-      deadlineAt: new Date(now.getTime() + duration).toISOString(),
+      deadlineAt,
+      ...(parsed.has("--fund") ? { fund: true } : {}),
       ...(intake === undefined ? {} : { intake: intake as "proposals" | "submissions" }),
       ...(maxAwards === undefined ? {} : { maxAwards }),
       ...(parsed.one("--webhook") === undefined ? {} : { webhook: parsed.one("--webhook")! }),
       onFeeUnavailable: () => io.stderr("The deployed fee is unavailable."),
     });
+    if (parsed.has("--fund")) {
+      if (outcome.funding?.error) {
+        taskOutput(
+          io,
+          json,
+          context,
+          verb,
+          { ...outcome.result, ok: false, funding: outcome.funding, postingMovesMoney: false },
+          [
+            `Posted task ${outcome.result.workOrder.id}.`,
+            `Funding unavailable: ${outcome.funding.error}.`,
+          ],
+        );
+        return 1;
+      }
+      try {
+        const target = signedIn(context);
+        const policy = await taskPolicyForWallet({
+          directory: getVapiPaths().directory,
+          wallet: target.name,
+          schema: registeredAgentProfileSchema,
+          warn: io.stderr,
+        });
+        const v2Prepared = taskV2PreparedSchema.safeParse(outcome.funding);
+        if (v2Prepared.success && (await taskUsesV2(context, outcome.result.workOrder.id))) {
+          const funding = await executeTaskV2(context, {
+            id: outcome.result.workOrder.id,
+            write: { action: "fund" },
+            prepared: v2Prepared.data,
+            preparationKey: outcome.fundingIdempotencyKey,
+            expectedGrossBaseUnits: prepared.escrowAmount,
+            policy,
+            caps: await spendCapsForWallet(target.store, target.name),
+            wallet: target.name,
+            ledgerPath: getVapiPaths().ledger,
+            approval: { granted: parsed.has("--yes") },
+            onMoney: (money) => {
+              io.stderr(money.line);
+            },
+          });
+          taskOutput(
+            io,
+            json,
+            context,
+            verb,
+            {
+              ...outcome.result,
+              ...funding,
+              funding,
+              postingMovesMoney: funding.ok,
+            },
+            [
+              `Posted task ${outcome.result.workOrder.id}.`,
+              funding.ok
+                ? "Hosted funding confirmed."
+                : "Funding requires policy approval or was refused.",
+            ],
+          );
+          return funding.ok ? undefined : "approval" in funding ? 3 : 2;
+        }
+        const funding = await fundTaskOperation(context, {
+          fundingIntent: outcome.funding,
+          expectedGrossBaseUnits: prepared.escrowAmount,
+          id: outcome.result.workOrder.id,
+          policy,
+          caps: await spendCapsForWallet(target.store, target.name),
+          wallet: target.name,
+          ledgerPath: getVapiPaths().ledger,
+          now: dependencies.now ?? (() => new Date()),
+          approval: { granted: parsed.has("--yes") },
+        });
+        const wait = funding.ok
+          ? await waitForTaskIndex(
+              context,
+              dependencies,
+              parsed,
+              json,
+              io,
+              outcome.result.workOrder.id,
+              funding.result,
+              "locked",
+              "funding",
+              parsed.one("--timeout") ?? "120s",
+              parseTaskDuration(parsed.one("--timeout") ?? "120s", now),
+            )
+          : null;
+        taskOutput(
+          io,
+          json,
+          context,
+          verb,
+          { ...outcome.result, ...funding, funding, wait, postingMovesMoney: funding.ok },
+          [
+            `Posted task ${outcome.result.workOrder.id}.`,
+            funding.ok
+              ? wait?.reached
+                ? "escrow funded"
+                : "Funding submitted; waiting for hosted confirmation."
+              : `Policy: ${funding.policyDecision}.`,
+          ],
+        );
+        return funding.ok ? undefined : "reason" in funding ? 2 : "approval" in funding ? 3 : 1;
+      } catch (error) {
+        const mapped = mapTaskError(error);
+        const detail = {
+          code:
+            mapped instanceof TaskCommandError
+              ? mapped.code
+              : mapped instanceof UsageError
+                ? "usage_error"
+                : "task_error",
+          message: mapped instanceof Error ? mapped.message : "Task funding failed.",
+        };
+        taskOutput(
+          io,
+          json,
+          context,
+          verb,
+          { ...outcome.result, ok: false, error: detail, funding: { state: "unknown" } },
+          [
+            `Posted task ${outcome.result.workOrder.id}.`,
+            `Funding did not complete: ${detail.message}`,
+            `Check vapi task show ${outcome.result.workOrder.id} before another payment.`,
+          ],
+        );
+        return 1;
+      }
+    }
     taskOutput(
       io,
       json,
@@ -609,7 +856,12 @@ async function taskCommandInner(
   }
   if (verb === "submit") {
     const urls = parsed.many("--proof");
-    if (!urls.length) throw new UsageError("submit needs at least one --proof <https-url>.");
+    if (parsed.one("--proposal-id") && !parsed.has("--withdraw"))
+      throw new UsageError("--proposal-id requires --withdraw.");
+    if (parsed.has("--withdraw") && (urls.length || parsed.many("--file").length))
+      throw new UsageError("--withdraw cannot be combined with proof or files.");
+    if (!parsed.has("--withdraw") && !urls.length)
+      throw new UsageError("submit needs at least one --proof <https-url>.");
     const proof: SubmissionProof[] = urls.map((url) => {
       httpsUrl(url, "--proof");
       return { kind: "url", value: url };
@@ -620,6 +872,12 @@ async function taskCommandInner(
       target = signedIn(context);
     const result = await submitTask(context, {
       id: id!,
+      ...(parsed.has("--withdraw")
+        ? { withdraw: true, ...(target.address ? { address: target.address } : {}) }
+        : {}),
+      ...(parsed.one("--proposal-id")
+        ? { proposalId: taskId(parsed.one("--proposal-id"), "proposalId") }
+        : {}),
       proof,
       files,
       unlock: async () => {
@@ -630,7 +888,48 @@ async function taskCommandInner(
         };
       },
     });
-    taskOutput(io, json, context, verb, result, [`Submitted proof for task ${id}.`]);
+    taskOutput(io, json, context, verb, result, [
+      parsed.has("--withdraw")
+        ? `Withdrew submission for task ${id}.`
+        : `Submitted proof for task ${id}.`,
+    ]);
+    return;
+  }
+  if (verb === "pending" || verb === "checkin") {
+    const context = await taskContext(parsed, io, dependencies);
+    signedIn(context);
+    if (verb === "pending") {
+      const result = await taskRequest(verb, "pending", () =>
+        requireTaskMethod(context.client, "pending")(),
+      );
+      taskOutput(
+        io,
+        json,
+        context,
+        verb,
+        result,
+        result.pendingActions.length
+          ? result.pendingActions.map(
+              (item) =>
+                `${item.title} · ${item.action} · ${item.amountBaseUnits ? `$${formatBaseUnitsUsd(item.amountBaseUnits)} USDC` : "amount unavailable"} · due ${item.dueAt ?? "unspecified"} · ${new URL(item.deepLink, context.baseUrl).href}`,
+            )
+          : ["No pending actions."],
+      );
+    } else {
+      const status = required(parsed, "--status");
+      const input = checkinInputSchema.safeParse({
+        status,
+        note: parsed.one("--note") ?? status.replaceAll("-", " "),
+        ...(parsed.one("--link") ? { link: parsed.one("--link") } : {}),
+      });
+      if (!input.success) throw new UsageError(input.error.issues[0]!.message);
+      const result = await taskRequest(verb, "checkin", () =>
+        requireTaskMethod(context.client, "checkin")(id!, input.data, {
+          idempotencyKey: context.randomUUID(),
+        }),
+      );
+      taskOutput(io, json, context, verb, result, [`Check-in recorded: ${status}.`]);
+    }
     return;
   }
   let proposalId: string | undefined, body: string | undefined, cursor: number | undefined;
@@ -647,7 +946,8 @@ async function taskCommandInner(
       const result = await showTask(context, { id: id!, signedIn: true });
       const receipts = result.receipts;
       taskOutput(io, json, context, verb, { ...result, receipts, ...(receipts[0] ?? {}) }, [
-        `${result.workOrder.title} · ${result.workOrder.state}`,
+        `${result.workOrder.title} · ${result.lifecycle?.state ?? result.workOrder.state}${result.lifecycle?.substate ? ` / ${result.lifecycle.substate}` : ""}`,
+        ...taskDetailLines(result.lifecycle, result.nextAction, result.workOrder.terms),
         ...receipts.map((receipt) => `Receipt (from escrow): ${receipt.receiptUrl}`),
       ]);
     } else {
@@ -685,10 +985,13 @@ async function taskCommandInner(
         verb,
         {
           task,
+          lifecycle: result.lifecycle,
+          nextAction: result.nextAction,
           ...(task.receiptUrl ? { receiptUrl: task.receiptUrl, receiptUrlSource: "server" } : {}),
         },
         [
-          `${task.title} · ${task.state}`,
+          `${task.title} · ${result.lifecycle?.state ?? task.state}`,
+          ...taskDetailLines(result.lifecycle, result.nextAction, task.terms),
           ...(task.receiptUrl ? [`Receipt (from server): ${task.receiptUrl}`] : []),
         ],
       );
@@ -922,6 +1225,37 @@ async function escrowTaskCommand(
       approval,
       ...(counterparty === undefined ? {} : { counterparty }),
     };
+    if (verb === "fund") {
+      const payment = await fundTaskWithX402(context, {
+        ...common,
+        config: await loadConfig(getVapiPaths().config, getEnvironment(dependencies)),
+        unlock: async () => (await unlockTarget(target, dependencies)).account,
+        ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}),
+      });
+      if (payment) {
+        const wait =
+          payment.ok && !parsed.has("--no-wait")
+            ? await waitForMilestone(context.client, {
+                orderId: id,
+                milestoneId: payment.milestoneId,
+                target: "locked",
+                timeoutMs: waitTimeoutMs!,
+                sleep: context.sleep,
+                now: dependencies.now ?? (() => new Date()),
+              })
+            : null;
+        taskOutput(io, json, context, verb, { ...payment, wait }, [
+          payment.ok
+            ? wait?.reached
+              ? "escrow funded"
+              : `Payment submitted; waiting for hosted confirmation. Run vapi task show ${id}.`
+            : "approval" in payment
+              ? "Policy: approval needed."
+              : "Policy: refused.",
+        ]);
+        return payment.ok ? undefined : "reason" in payment ? 2 : "approval" in payment ? 3 : 1;
+      }
+    }
     const outcome =
       verb === "fund"
         ? await fundTaskOperation(context, {
@@ -977,7 +1311,7 @@ async function escrowTaskCommand(
       verb,
       wait === undefined ? outcome : { ...outcome, wait },
       verb === "fund"
-        ? wait === null || wait?.reached
+        ? wait?.reached
           ? ["escrow funded"]
           : []
         : [`Completed task ${verb} for ${id}.`],
@@ -1155,7 +1489,7 @@ async function watchTask(
       );
       if (!eventPage.events.length) continue;
       const event = eventPage.events[0]!;
-      taskOutput(io, json, context, "watch", { event }, [`${event.sequence}: ${event.type}`]);
+      taskOutput(io, json, context, "watch", { event }, [taskEventLine(event)]);
       const state = taskEventState(event);
       if (autoRelease && state === "delivered") {
         const milestoneId =
@@ -1331,4 +1665,33 @@ function taskCounterparty(parsed: Parsed): string | undefined {
   if (value !== undefined && !/^0x[0-9a-fA-F]{40}$/u.test(value))
     throw new UsageError("--counterparty must be 0x followed by 40 hexadecimal characters.");
   return value?.toLowerCase();
+}
+
+function enumOption<const T extends string>(
+  value: string | undefined,
+  options: readonly T[],
+  flag: string,
+): T | undefined {
+  if (value === undefined) return undefined;
+  if (!options.includes(value as T)) throw new UsageError(`${flag} must be ${options.join("|")}.`);
+  return value as T;
+}
+function taskDetailLines(
+  lifecycle: import("@vapi-network/core/tasks").TaskLifecycle | null | undefined,
+  nextAction: import("@vapi-network/core/tasks").TaskNextAction | undefined,
+  terms: import("@vapi-network/core/tasks").TaskTerms | undefined,
+): string[] {
+  const milestones = terms?.milestones;
+  return [
+    ...(milestones?.length
+      ? [
+          "Milestone | Amount (USDC) | Acceptance | Deadline | State",
+          ...milestones.map(
+            (item) =>
+              `${item.index} | ${formatBaseUnitsUsd(item.amountBaseUnits)} | ${item.acceptance} | ${item.deadlineAt} | ${lifecycle?.shape === "task" ? (lifecycle.milestones[item.index - 1]?.status ?? "pending") : "pending"}`,
+          ),
+        ]
+      : []),
+    `Next action: ${nextAction?.action ?? "none"}${nextAction?.dueAt ? ` · due ${nextAction.dueAt}` : ""}`,
+  ];
 }
