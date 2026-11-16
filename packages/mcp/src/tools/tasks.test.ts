@@ -1491,6 +1491,8 @@ describe("task MCP tools", () => {
             "dispute",
             "counter-evidence",
             "resolve-unmatched",
+            "approve-bond",
+            "claim-owed",
           ].includes(verb)
         ) {
           expect(tool.description).toMatch(/^Executes the user's own /u);
@@ -2403,5 +2405,168 @@ describe("hosted-prepared V2 participant tools", () => {
       ).isError,
     ).toBe(true);
     expect(executeV2).not.toHaveBeenCalled();
+  });
+});
+
+describe("V2 jury and reviewer tools", () => {
+  const COMMITMENT = `0x${"cd".repeat(32)}` as `0x${string}`;
+  const SALT = `0x${"5a".repeat(32)}` as `0x${string}`;
+  const RESOLVER = `0x${"99".repeat(20)}`;
+  function juryChain() {
+    const executeV2 = vi.fn().mockResolvedValue({
+      ok: true,
+      orderId: ID,
+      operation: { id: ESCROW, state: "confirmed" },
+      lifecycle: null,
+      nextAction: null,
+    });
+    const ballot = {
+      version: "vapi-tasks-ballot-v1",
+      orderId: ID,
+      chainId: 84532,
+      resolver: RESOLVER,
+      escrow: RESOLVER,
+      i: 0,
+      caseId: COMMITMENT,
+      voter: RESOLVER,
+      outcome: 1,
+      toWorker: "0",
+      salt: SALT,
+      commitment: COMMITMENT,
+      createdAt: NOW,
+    };
+    const juryV2 = {
+      caseState: vi.fn(async () => ({ state: 3, name: "JuryDrawPending", resolver: RESOLVER })),
+      sealBallot: vi.fn(async () => ({ ballot, reused: false, path: "/home/ballot.json" })),
+      openBallot: vi.fn(async () => ({ ballot, path: "/home/ballot.json" })),
+    };
+    return {
+      executeV2,
+      juryV2,
+      chain: { ...missingTasksChain, executeV2, juryV2 } as unknown as TasksChain,
+    };
+  }
+
+  it.each([
+    ["jury", { i: 0, step: "open" }, { action: "open-jury", i: 0 }],
+    ["jury", { i: 2, step: "resolve" }, { action: "resolve", i: 2 }],
+    ["approve-bond", {}, { action: "approve-bond" }],
+    ["claim-owed", {}, { action: "claim-owed" }],
+    ["claim-owed", { to: RESOLVER }, { action: "claim-owed", to: RESOLVER }],
+    [
+      "vote",
+      { i: 0, action: "commit", outcome: "poster" },
+      { action: "commit-vote", i: 0, commitment: COMMITMENT },
+    ],
+    [
+      "vote",
+      { i: 0, action: "reveal" },
+      { action: "reveal-vote", i: 0, outcome: 1, toWorker: "0", salt: SALT },
+    ],
+  ])(
+    "runs tasks.%s through the shared executor without granting approval",
+    async (verb, fields, write) => {
+      const fake = juryChain();
+      const { server } = await watchServer({
+        client: {} as TasksClient,
+        chain: fake.chain,
+        now: () => new Date(NOW),
+      });
+      const result = await server.callTool({
+        name: `tasks.${verb}`,
+        arguments: { id: ID, ...fields },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(fake.executeV2).toHaveBeenCalledWith(
+        expect.objectContaining({ id: ID, approval: { granted: false }, write }),
+      );
+      // A sealed ballot's salt never appears in a tool result.
+      expect(JSON.stringify(result.structuredContent)).not.toContain(SALT.slice(2, 12));
+    },
+  );
+
+  it("validates jury and vote arguments before any signing", async () => {
+    const fake = juryChain();
+    const { server } = await watchServer({
+      client: {} as TasksClient,
+      chain: fake.chain,
+      now: () => new Date(NOW),
+    });
+    for (const arguments_ of [
+      { name: "tasks.jury", arguments: { id: ID, i: 0, step: "appeal" } },
+      { name: "tasks.jury", arguments: { id: ID, i: 5, step: "open" } },
+      { name: "tasks.vote", arguments: { id: ID, i: 0, action: "commit" } },
+      { name: "tasks.vote", arguments: { id: ID, i: 0, action: "commit", outcome: "split" } },
+      {
+        name: "tasks.vote",
+        arguments: { id: ID, i: 0, action: "commit", outcome: "worker", toWorker: "5" },
+      },
+      { name: "tasks.vote", arguments: { id: ID, i: 0, action: "reveal", outcome: "worker" } },
+      { name: "tasks.claim-owed", arguments: { id: ID, to: "0x1234" } },
+      { name: "tasks.reviewer-status", arguments: { address: "0x1234" } },
+    ]) {
+      const result = await server.callTool(arguments_);
+      expect(result.isError, JSON.stringify(arguments_)).toBe(true);
+      expect(JSON.parse((result.content as Array<{ text: string }>)[0]!.text).code).toBe(
+        "invalid_input",
+      );
+    }
+    expect(fake.executeV2).not.toHaveBeenCalled();
+    expect(fake.juryV2.sealBallot).not.toHaveBeenCalled();
+  });
+
+  it("reads reviewer status for an address from local RPC reads", async () => {
+    const values: Record<string, unknown> = {
+      disputeResolver: RESOLVER,
+      registry: RESOLVER,
+      vapiId: RESOLVER,
+      stakeGate: RESOLVER,
+      staking: RESOLVER,
+      isReviewer: true,
+      hasId: false,
+      stakedBalance: 0n,
+      threshold: 1000n,
+      isEligible: false,
+      available: false,
+      suspended: false,
+      claimable: 0n,
+      missedReveals: 0,
+    };
+    const { server } = await watchServer({
+      client: {
+        deployment: vi.fn(async () => ({ configured: true, chainId: 84532 })),
+      } as unknown as TasksClient,
+      chain: juryChain().chain,
+      now: () => new Date(NOW),
+      rpcFor: () =>
+        ({
+          getChainId: async () => 84532,
+          readContract: async ({ functionName }: { functionName: string }) => values[functionName],
+        }) as unknown as import("viem").PublicClient,
+    });
+    vi.stubEnv("VAPI_TASKS_V2_ESCROW_FACTORY_84532", RESOLVER);
+    vi.stubEnv("VAPI_TASKS_V2_POOL_FACTORY_84532", RESOLVER);
+    vi.stubEnv("VAPI_TASKS_V2_USDC_84532", RESOLVER);
+    vi.stubEnv("VAPI_TASKS_V2_USDC_NAME_84532", "USD Coin");
+    vi.stubEnv("VAPI_TASKS_V2_USDC_VERSION_84532", "2");
+    const notice = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await server.callTool({
+        name: "tasks.reviewer-status",
+        arguments: { address: RESOLVER },
+      });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        isReviewer: true,
+        hasId: false,
+        staked: "0",
+        threshold: "1000",
+        meetsStake: false,
+        ready: false,
+      });
+    } finally {
+      notice.mockRestore();
+      vi.unstubAllEnvs();
+    }
   });
 });
