@@ -892,6 +892,8 @@ export async function verifyUnmatchedSettlement(
   const resolver = address.parse(
     await v2Read(target.rpc, target.pin.escrowFactoryV2, escrowFactoryV2Abi, "disputeResolver"),
   );
+  if (!same(resolver, target.pin.disputeResolverV3))
+    return v2GuardFailure("The factory dispute resolver differs from the local V2 deployment pin.");
   const stage = Number(
     await v2Read(target.rpc, resolver, disputeResolverV3Abi, "stage", [target.escrow, i]),
   );
