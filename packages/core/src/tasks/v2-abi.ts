@@ -1376,3 +1376,236 @@ export const disputeResolverV3Abi = [
     stateMutability: "view",
   },
 ] as const;
+
+// Jury, vote, reviewer and owed-credit entries, selected unchanged from vAPI-Network/vapi-app
+// tasks-v1 2621284b3 apps/api/app/tasks/server/chain/abi/tasks-v2.generated.ts.
+// DisputeResolverV3.json sha256: 7ff0cc47b7ee48e0ebbd3e61c5d6fc3b8a81801c8300ffd7a6800cf7ef611c26
+// EscrowV2.json sha256: 0f8df0cba09e523a0d68e0f621995e023ac29e8e2c5aac818a5db7ef15b6e434
+// (BountyEscrowV2.json sha256: f768d9b683205729a764b4153c20cd464b42587822efb612e28144eaf34519c8
+// carries the same claimOwed and owed entries.) Decoding and reads only.
+export const disputeResolverV3JuryAbi = [
+  {
+    type: "function",
+    name: "openJury",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "continueJury",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "drawJury",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "rearmDraw",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "commitVote",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+      { name: "commitment", type: "bytes32", internalType: "bytes32" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "revealVote",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+      { name: "outcome", type: "uint8", internalType: "enum IEscrowV2.Outcome" },
+      { name: "toWorker", type: "uint96", internalType: "uint96" },
+      { name: "salt", type: "bytes32", internalType: "bytes32" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "resolve",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "voteCommitment",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+      { name: "reviewer", type: "address", internalType: "address" },
+      { name: "outcome", type: "uint8", internalType: "enum IEscrowV2.Outcome" },
+      { name: "toWorker", type: "uint96", internalType: "uint96" },
+      { name: "salt", type: "bytes32", internalType: "bytes32" },
+    ],
+    outputs: [{ name: "", type: "bytes32", internalType: "bytes32" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "commitments",
+    inputs: [
+      { name: "caseId", type: "bytes32", internalType: "bytes32" },
+      { name: "reviewer", type: "address", internalType: "address" },
+    ],
+    outputs: [{ name: "commitment", type: "bytes32", internalType: "bytes32" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "currentCaseId",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+    ],
+    outputs: [{ name: "", type: "bytes32", internalType: "bytes32" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "caseData",
+    inputs: [
+      { name: "escrow", type: "address", internalType: "address" },
+      { name: "i", type: "uint8", internalType: "uint8" },
+    ],
+    outputs: [
+      {
+        name: "",
+        type: "tuple",
+        internalType: "struct DisputeResolverV3.CaseData",
+        components: [
+          { name: "state", type: "uint8", internalType: "enum DisputeResolverV3.CaseState" },
+          { name: "juryMode", type: "uint8", internalType: "enum DisputeResolverV3.JuryMode" },
+          { name: "raisedBy", type: "address", internalType: "address" },
+          { name: "raisedAt", type: "uint64", internalType: "uint64" },
+          { name: "evidenceDeadline", type: "uint64", internalType: "uint64" },
+          { name: "commitDeadline", type: "uint64", internalType: "uint64" },
+          { name: "revealDeadline", type: "uint64", internalType: "uint64" },
+          { name: "drawBlock", type: "uint64", internalType: "uint64" },
+          { name: "revealCount", type: "uint8", internalType: "uint8" },
+          { name: "committedCount", type: "uint8", internalType: "uint8" },
+          { name: "eligiblePoolSize", type: "uint32", internalType: "uint32" },
+          { name: "round", type: "uint32", internalType: "uint32" },
+          { name: "noQuorum", type: "bool", internalType: "bool" },
+          { name: "snapshotRemaining", type: "uint32", internalType: "uint32" },
+          { name: "voteCounts", type: "uint8[3]", internalType: "uint8[3]" },
+          { name: "reviewers", type: "address[5]", internalType: "address[5]" },
+        ],
+      },
+    ],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "hasRevealed",
+    inputs: [
+      { name: "caseId", type: "bytes32", internalType: "bytes32" },
+      { name: "reviewer", type: "address", internalType: "address" },
+    ],
+    outputs: [{ name: "revealed", type: "bool", internalType: "bool" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "registry",
+    inputs: [],
+    outputs: [{ name: "", type: "address", internalType: "contract IReviewerRegistryV2" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "stakeGate",
+    inputs: [],
+    outputs: [{ name: "", type: "address", internalType: "contract IReviewersGate" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "vapiId",
+    inputs: [],
+    outputs: [{ name: "", type: "address", internalType: "contract IVapiIdV1" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "available",
+    inputs: [{ name: "reviewer", type: "address", internalType: "address" }],
+    outputs: [{ name: "value", type: "bool", internalType: "bool" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "suspended",
+    inputs: [{ name: "reviewer", type: "address", internalType: "address" }],
+    outputs: [{ name: "value", type: "bool", internalType: "bool" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "claimable",
+    inputs: [{ name: "account", type: "address", internalType: "address" }],
+    outputs: [{ name: "amount", type: "uint256", internalType: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "missedReveals",
+    inputs: [{ name: "reviewer", type: "address", internalType: "address" }],
+    outputs: [{ name: "count", type: "uint8", internalType: "uint8" }],
+    stateMutability: "view",
+  },
+] as const;
+export const escrowV2OwedAbi = [
+  {
+    type: "function",
+    name: "DISPUTE_RESOLVER",
+    inputs: [],
+    outputs: [{ name: "", type: "address", internalType: "address" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "claimOwed",
+    inputs: [{ name: "to", type: "address", internalType: "address" }],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "owed",
+    inputs: [{ name: "account", type: "address", internalType: "address" }],
+    outputs: [{ name: "amount", type: "uint256", internalType: "uint256" }],
+    stateMutability: "view",
+  },
+] as const;

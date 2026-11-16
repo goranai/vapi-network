@@ -9,6 +9,8 @@ export type TasksV2Deployment = {
   usdcVersion: string;
   offerTtlSeconds?: number;
   choiceWindowSeconds?: number;
+  /** Optional DisputeResolverV3 pin; jury plans must also match the verified clone's resolver. */
+  disputeResolverV3?: Address;
 };
 export type TasksV2DeploymentOverrides = Partial<Record<number, TasksV2Deployment>>;
 
@@ -50,6 +52,9 @@ export function getTrustedTasksV2Deployment(
       ...(env[`VAPI_TASKS_V2_CHOICE_WINDOW_SECONDS_${chainId}`] !== undefined
         ? { choiceWindowSeconds: Number(env[`VAPI_TASKS_V2_CHOICE_WINDOW_SECONDS_${chainId}`]) }
         : {}),
+      ...(env[`VAPI_TASKS_V2_DISPUTE_RESOLVER_${chainId}`]?.trim()
+        ? { disputeResolverV3: env[`VAPI_TASKS_V2_DISPUTE_RESOLVER_${chainId}`]!.trim() as Address }
+        : {}),
     };
   }
   const tuple = configured ?? TRUSTED_TASKS_V2_DEPLOYMENTS[chainId];
@@ -63,11 +68,15 @@ export function getTrustedTasksV2Deployment(
     escrowFactoryV2: getAddress(tuple.escrowFactoryV2),
     bountyPoolFactoryV1: getAddress(tuple.bountyPoolFactoryV1),
     usdc: getAddress(tuple.usdc),
+    ...(tuple.disputeResolverV3 ? { disputeResolverV3: getAddress(tuple.disputeResolverV3) } : {}),
   };
   if (
-    [normalized.escrowFactoryV2, normalized.bountyPoolFactoryV1, normalized.usdc].includes(
-      zeroAddress,
-    ) ||
+    [
+      normalized.escrowFactoryV2,
+      normalized.bountyPoolFactoryV1,
+      normalized.usdc,
+      ...(normalized.disputeResolverV3 ? [normalized.disputeResolverV3] : []),
+    ].includes(zeroAddress) ||
     [tuple.offerTtlSeconds, tuple.choiceWindowSeconds].some(
       (value) => value !== undefined && (!Number.isSafeInteger(value) || value <= 0),
     ) ||
@@ -80,7 +89,7 @@ export function getTrustedTasksV2Deployment(
     );
   if (configured)
     (options.notice ?? console.error)(
-      `Tasks V2 untrusted override for chain ${chainId}: escrow factory ${normalized.escrowFactoryV2}, pool factory ${normalized.bountyPoolFactoryV1}, USDC ${normalized.usdc}.`,
+      `Tasks V2 untrusted override for chain ${chainId}: escrow factory ${normalized.escrowFactoryV2}, pool factory ${normalized.bountyPoolFactoryV1}, USDC ${normalized.usdc}${normalized.disputeResolverV3 ? `, resolver ${normalized.disputeResolverV3}` : ""}.`,
     );
   return normalized;
 }

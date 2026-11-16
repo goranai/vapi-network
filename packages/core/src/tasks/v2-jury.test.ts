@@ -1,0 +1,825 @@
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  encodeFunctionData,
+  getAddress,
+  keccak256,
+  parseAbi,
+  toHex,
+  zeroAddress,
+  zeroHash,
+  type Hex,
+  type PublicClient,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+
+import {
+  listTaskV2Ballots,
+  readTaskV2Ballot,
+  taskV2BallotPath,
+  writeTaskV2Ballot,
+  type TaskV2Ballot,
+} from "./ballots.js";
+import type { TasksChainOptions } from "./chain.js";
+import type { TasksClient } from "./client.js";
+import type { TaskOperationContext } from "./operation-support.js";
+import { createPendingTransactions } from "./pending-transactions.js";
+import { readSpendLedger } from "../spend-policy.js";
+import { disputeResolverV3JuryAbi, escrowV2OwedAbi } from "./v2-abi.js";
+import { createTaskV2Executor } from "./v2-execution.js";
+import {
+  createTaskV2Jury,
+  readTaskV2ReviewerStatus,
+  runTaskV2Jury,
+  runTaskV2Vote,
+} from "./v2-jury.js";
+import { acceptedV2TermsHash, verifyV2Plan, verifyV2Target } from "./v2-plan-guard.js";
+import { taskV2OperationResponseSchema, type TaskV2Action } from "./v2-write.js";
+import { V2_WRITE_OPERATION, V2_WRITE_ORDER } from "./fixtures/tasks-v2-writes.js";
+import type { WalletName } from "../wallet-name.js";
+
+vi.mock("viem/actions", () => ({
+  prepareTransactionRequest: vi.fn(async (_rpc, request) => ({
+    ...request,
+    type: "eip1559",
+    gas: 100000n,
+    maxFeePerGas: 10n,
+    maxPriorityFeePerGas: 1n,
+  })),
+}));
+
+const homes: string[] = [];
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await Promise.all(homes.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+const account = privateKeyToAccount(`0x${"77".repeat(32)}`);
+const POSTER = getAddress(`0x${"aa".repeat(20)}`);
+const ESCROW = getAddress(`0x${"22".repeat(20)}`);
+const USDC = getAddress(`0x${"44".repeat(20)}`);
+const FACTORY = getAddress(`0x${"55".repeat(20)}`);
+const POOL_FACTORY = getAddress(`0x${"66".repeat(20)}`);
+const RESOLVER = getAddress(`0x${"99".repeat(20)}`);
+const OTHER = getAddress(`0x${"bb".repeat(20)}`);
+const CASE_ID = `0x${"c1".repeat(32)}` as Hex;
+const DEADLINE = "2026-10-28T12:00:00.000Z";
+const NOW_SECONDS = BigInt(Date.parse("2026-10-26T12:00:00Z") / 1000);
+const PIN = {
+  escrowFactoryV2: FACTORY,
+  bountyPoolFactoryV1: POOL_FACTORY,
+  usdc: USDC,
+  usdcName: "USD Coin",
+  usdcVersion: "2",
+  offerTtlSeconds: 86400,
+};
+const SALT = `0x${"5a".repeat(32)}` as Hex;
+const statuses = ["pending", "submitted", "released", "refunded", "disputed", "split"];
+const approvalAbi = parseAbi(["function approve(address spender, uint256 amount) returns (bool)"]);
+
+function view(workerBondBp?: number) {
+  return {
+    workOrder: {
+      id: V2_WRITE_ORDER,
+      clientAddress: POSTER,
+      title: "Deliver useful proof",
+      description: "Deliver the requested proof for this task.",
+      market: { budget: { network: "eip155:84532", amountBaseUnits: "100000000" } },
+      terms: {
+        shape: "task",
+        milestones: [
+          {
+            index: 1,
+            amountBaseUnits: "100000000",
+            acceptance: "A useful proof",
+            deadlineAt: DEADLINE,
+          },
+        ],
+        ...(workerBondBp === undefined ? {} : { workerBondBp }),
+      },
+      v2State: {
+        escrow: ESCROW,
+        feeBp: 500,
+        totalBaseUnits: "100000000",
+        paidBaseUnits: "0",
+        refundedBaseUnits: "0",
+        milestones: [{ amountBaseUnits: "100000000", status: "disputed" }],
+      },
+    },
+    lifecycle: { shape: "task", state: "Active" },
+    nextAction: { action: "judge" },
+  };
+}
+/** Deterministic stand-in for the resolver's own voteCommitment view. */
+function fakeCommitment(args: readonly unknown[]): Hex {
+  return keccak256(
+    toHex(
+      JSON.stringify(args, (_, v: unknown) =>
+        typeof v === "bigint" ? v.toString() : typeof v === "string" ? v.toLowerCase() : v,
+      ),
+    ),
+  );
+}
+
+/** What the hosted builder encodes for each write; the guard decodes and binds it locally. */
+function hostedPlan(write: TaskV2Action) {
+  const at = [ESCROW, "i" in write ? write.i : 0] as const;
+  const resolverCall = (functionName: string, args: readonly unknown[]) => ({
+    to: RESOLVER,
+    data: encodeFunctionData({
+      abi: disputeResolverV3JuryAbi,
+      functionName: functionName as "openJury",
+      args: args as never,
+    }),
+  });
+  switch (write.action) {
+    case "open-jury":
+      return { step: "v2-open-jury", ...resolverCall("openJury", at) };
+    case "draw-jury":
+      return { step: "v2-draw-jury", ...resolverCall("drawJury", at) };
+    case "rearm-draw":
+      return { step: "v2-rearm-draw", ...resolverCall("rearmDraw", at) };
+    case "resolve":
+      return { step: "v2-resolve", ...resolverCall("resolve", at) };
+    case "commit-vote":
+      return { step: "v2-commit-vote", ...resolverCall("commitVote", [...at, write.commitment]) };
+    case "reveal-vote":
+      return {
+        step: "v2-reveal-vote",
+        ...resolverCall("revealVote", [...at, write.outcome, BigInt(write.toWorker), write.salt]),
+      };
+    case "approve-bond":
+      return {
+        step: "v2-approve-usdc",
+        to: USDC,
+        data: encodeFunctionData({
+          abi: approvalAbi,
+          functionName: "approve",
+          args: [ESCROW, 10_000_000n],
+        }),
+      };
+    case "claim-owed":
+      return {
+        step: "v2-claim-owed",
+        to: ESCROW,
+        data: encodeFunctionData({
+          abi: escrowV2OwedAbi,
+          functionName: "claimOwed",
+          args: [write.to ?? account.address],
+        }),
+      };
+    default:
+      throw new Error(`No hosted plan for ${write.action}`);
+  }
+}
+function operation(plan: { step: string; to: string; data: Hex }) {
+  return taskV2OperationResponseSchema.parse({
+    orderId: V2_WRITE_ORDER,
+    operation: {
+      id: V2_WRITE_OPERATION,
+      kind: "tasks-v2-write",
+      state: "prepared",
+      step: plan.step,
+      expectedActor: account.address,
+      transactionHash: null,
+      plan: {
+        version: "work-transaction-plan-v2",
+        operationId: V2_WRITE_OPERATION,
+        step: plan.step,
+        chainId: 84532,
+        network: "eip155:84532",
+        from: account.address,
+        to: plan.to,
+        data: plan.data,
+        value: "0",
+      },
+    },
+  });
+}
+
+async function fixture(options: { worker?: string; workerBondBp?: number } = {}) {
+  const home = await mkdtemp(join(tmpdir(), "vapi-v2-jury-"));
+  homes.push(home);
+  const order = view(options.workerBondBp);
+  const chain = {
+    commitment: zeroHash as Hex,
+    caseStates: [2] as number[],
+    resolverOnClone: RESOLVER as string,
+    owed: 5_000_000n,
+  };
+  const rpc = {
+    getChainId: vi.fn(async () => 84532),
+    getTransactionCount: vi.fn(async () => 0),
+    sendRawTransaction: vi.fn(async ({ serializedTransaction }: { serializedTransaction: Hex }) =>
+      keccak256(serializedTransaction),
+    ),
+    waitForTransactionReceipt: vi.fn(async () => ({ status: "success" })),
+    getBlock: vi.fn(async () => ({ timestamp: NOW_SECONDS })),
+    readContract: vi.fn(
+      async (call: {
+        functionName: string;
+        args?: readonly unknown[];
+        address?: string;
+      }): Promise<unknown> => {
+        switch (call.functionName) {
+          case "isEscrow":
+            return true;
+          case "usdc":
+            return USDC;
+          case "poster":
+            return POSTER;
+          case "worker":
+            return options.worker ?? OTHER;
+          case "shape":
+          case "winners":
+            return 0;
+          case "rewardPerWinner":
+            return 0n;
+          case "offerTtl":
+            return 86400n;
+          case "choiceWindow":
+          case "reviewWindow":
+            return 604800n;
+          case "total":
+            return 100000000n;
+          case "feeBp":
+            return 500;
+          case "termsHash":
+            return acceptedV2TermsHash(
+              order as unknown as import("./types.js").GetOrderResponse,
+              PIN,
+              604800n,
+            );
+          case "termsDigest":
+            return `0x${"12".repeat(32)}`;
+          case "milestoneCount":
+            return 1;
+          case "milestone": {
+            const m = order.workOrder.v2State.milestones[Number(call.args![0])]!;
+            return {
+              amount: BigInt(m.amountBaseUnits),
+              deadline: BigInt(Date.parse(DEADLINE) / 1000),
+              status: statuses.indexOf(m.status),
+            };
+          }
+          case "predictEscrow":
+            return ESCROW;
+          case "DISPUTE_RESOLVER":
+            return chain.resolverOnClone;
+          case "currentCaseId":
+            return CASE_ID;
+          case "commitments":
+            return chain.commitment;
+          case "voteCommitment":
+            return fakeCommitment(call.args!);
+          case "caseData":
+            return { state: chain.caseStates.shift() ?? 4 };
+          case "owed":
+            return chain.owed;
+          default:
+            throw new Error(`Unexpected RPC read ${call.functionName}`);
+        }
+      },
+    ),
+  };
+  const writes: TaskV2Action[] = [];
+  const events: string[] = [];
+  const client = {
+    prepareV2: vi.fn(async (_id: string, write: TaskV2Action) => {
+      writes.push(write);
+      events.push(`prepare:${write.action}`);
+      return operation(hostedPlan(write));
+    }),
+    signV2: vi.fn(),
+    confirmV2Signature: vi.fn(),
+    operationV2: vi.fn(
+      async (_id: string, mode: string, body: { step: string; transactionHash?: string }) => {
+        const write = writes.at(-1)!;
+        const prepared = operation(hostedPlan(write));
+        if (mode === "recover") return { ...prepared, recovered: false, scanComplete: true };
+        return {
+          ...prepared,
+          operation: {
+            ...prepared.operation,
+            state: mode === "transaction" ? "submitted" : "confirmed",
+            transactionHash: body.transactionHash,
+          },
+        };
+      },
+    ),
+    getOrder: vi.fn(async () => order),
+    deployment: vi.fn(async () => ({
+      configured: true,
+      chainId: 84532,
+      network: "eip155:84532",
+      usdc: USDC,
+      feeBp: 500,
+    })),
+  };
+  const pending = createPendingTransactions(home);
+  const options_: TasksChainOptions = {
+    client: client as unknown as TasksClient,
+    account,
+    pending,
+    rpcFor: () => rpc as unknown as PublicClient,
+    sleep: vi.fn(async () => {}),
+    env: {},
+    trustedV2Deployments: { 84532: PIN },
+    onV2UntrustedOverride: vi.fn(),
+    now: () => new Date("2026-10-26T12:00:00Z"),
+    randomBytes: (size) => new Uint8Array(size).fill(0x5a),
+    ballotsHome: home,
+  };
+  const context: TaskOperationContext = {
+    client: client as unknown as TasksClient,
+    chain: {
+      available: true,
+      executeV2: createTaskV2Executor(options_),
+      juryV2: createTaskV2Jury(options_),
+    } as unknown as TaskOperationContext["chain"],
+    pending,
+    baseUrl: "https://tasks.example",
+    randomUUID: () => crypto.randomUUID(),
+    signInHint: "sign in",
+  };
+  const base = {
+    id: V2_WRITE_ORDER,
+    policy: { maxPerTaskUsd: 200, approveAboveUsd: 200 },
+    caps: { perCallAtomic: "1", perDayAtomic: "200000000" },
+    wallet: "juror" as WalletName,
+    ledgerPath: join(home, "spend-ledger.json"),
+  };
+  return { home, rpc, client, chain, options: options_, context, base, order, writes, events };
+}
+
+async function guard(
+  f: Awaited<ReturnType<typeof fixture>>,
+  action: TaskV2Action,
+  plan = hostedPlan(action),
+  pays = 0n,
+) {
+  const op = operation(plan);
+  const target = await verifyV2Target(
+    f.options,
+    op,
+    f.order as unknown as import("./types.js").GetOrderResponse,
+    action,
+  );
+  return verifyV2Plan(target, op.operation, action, pays);
+}
+
+describe("V2 jury plan guard", () => {
+  const COMMIT = `0x${"ab".repeat(32)}` as Hex;
+  const accepted: TaskV2Action[] = [
+    { action: "open-jury", i: 0 },
+    { action: "draw-jury", i: 0 },
+    { action: "rearm-draw", i: 0 },
+    { action: "resolve", i: 0 },
+    { action: "commit-vote", i: 0, commitment: COMMIT },
+    { action: "reveal-vote", i: 0, outcome: 2, toWorker: "40000000", salt: SALT },
+    { action: "claim-owed" },
+    { action: "claim-owed", to: OTHER },
+  ];
+  it.each(accepted)("accepts the hosted plan for $action", async (action) => {
+    const f = await fixture();
+    await expect(guard(f, action)).resolves.toBeUndefined();
+  });
+
+  it("accepts continueJury for a Snapshotting open step", async () => {
+    const f = await fixture();
+    const action = { action: "open-jury", i: 0 } as const;
+    const plan = {
+      step: "v2-open-jury",
+      to: RESOLVER,
+      data: encodeFunctionData({
+        abi: disputeResolverV3JuryAbi,
+        functionName: "continueJury",
+        args: [ESCROW, 0],
+      }),
+    };
+    await expect(guard(f, action, plan)).resolves.toBeUndefined();
+  });
+
+  it("accepts the worker bond approval of the verified clone for the agreed amount", async () => {
+    const f = await fixture({ worker: zeroAddress, workerBondBp: 1000 });
+    await expect(
+      guard(f, { action: "approve-bond" }, hostedPlan({ action: "approve-bond" }), 10_000_000n),
+    ).resolves.toBeUndefined();
+  });
+
+  const reveal = {
+    action: "reveal-vote",
+    i: 0,
+    outcome: 2,
+    toWorker: "40000000",
+    salt: SALT,
+  } as const;
+  const mismatches: Array<[string, TaskV2Action, TaskV2Action]> = [
+    ["i", { action: "resolve", i: 0 }, { action: "resolve", i: 1 }],
+    [
+      "commitment",
+      { action: "commit-vote", i: 0, commitment: COMMIT },
+      { action: "commit-vote", i: 0, commitment: `0x${"cd".repeat(32)}` },
+    ],
+    ["outcome", reveal, { ...reveal, outcome: 0, toWorker: "0" }],
+    ["toWorker", reveal, { ...reveal, toWorker: "40000001" }],
+    ["salt", reveal, { ...reveal, salt: `0x${"5b".repeat(32)}` }],
+    ["selector", { action: "draw-jury", i: 0 }, { action: "rearm-draw", i: 0 }],
+    ["claim recipient", { action: "claim-owed", to: OTHER }, { action: "claim-owed" }],
+  ];
+  it.each(mismatches)("rejects a plan with another %s", async (_label, requested, prepared) => {
+    const f = await fixture();
+    const plan = { ...hostedPlan(prepared), step: hostedPlan(requested).step };
+    await expect(guard(f, requested, plan)).rejects.toMatchObject({ code: "v2_plan_mismatch" });
+  });
+
+  it("rejects a resolver plan sent anywhere but the clone's DISPUTE_RESOLVER()", async () => {
+    const f = await fixture();
+    const action = { action: "resolve", i: 0 } as const;
+    await expect(guard(f, action, { ...hostedPlan(action), to: OTHER })).rejects.toMatchObject({
+      code: "v2_plan_mismatch",
+    });
+  });
+
+  it("rejects a resolver that is not the verified clone's, even when the plan matches it", async () => {
+    const f = await fixture();
+    f.chain.resolverOnClone = OTHER;
+    const action = { action: "open-jury", i: 0 } as const;
+    await expect(guard(f, action)).rejects.toMatchObject({ code: "v2_plan_mismatch" });
+  });
+
+  it("rejects a clone resolver that differs from the local resolver pin", async () => {
+    const f = await fixture();
+    f.options.trustedV2Deployments = { 84532: { ...PIN, disputeResolverV3: OTHER } };
+    await expect(guard(f, { action: "draw-jury", i: 0 })).rejects.toMatchObject({
+      code: "v2_plan_mismatch",
+    });
+  });
+
+  it("rejects a bond approval with another spender, another amount, or from the poster", async () => {
+    const f = await fixture({ worker: zeroAddress, workerBondBp: 1000 });
+    const other = {
+      step: "v2-approve-usdc",
+      to: USDC,
+      data: encodeFunctionData({
+        abi: approvalAbi,
+        functionName: "approve",
+        args: [OTHER, 10_000_000n],
+      }),
+    };
+    await expect(guard(f, { action: "approve-bond" }, other, 10_000_000n)).rejects.toMatchObject({
+      code: "v2_plan_mismatch",
+    });
+    await expect(
+      guard(f, { action: "approve-bond" }, hostedPlan({ action: "approve-bond" }), 9_000_000n),
+    ).rejects.toMatchObject({ code: "v2_plan_mismatch" });
+    const poster = await fixture({ worker: OTHER, workerBondBp: 1000 });
+    await expect(
+      guard(
+        poster,
+        { action: "approve-bond" },
+        hostedPlan({ action: "approve-bond" }),
+        10_000_000n,
+      ),
+    ).rejects.toMatchObject({ code: "v2_plan_mismatch" });
+  });
+
+  it("rejects a claim-owed plan that targets another contract", async () => {
+    const f = await fixture();
+    const action = { action: "claim-owed" } as const;
+    await expect(guard(f, action, { ...hostedPlan(action), to: RESOLVER })).rejects.toMatchObject({
+      code: "v2_plan_mismatch",
+    });
+  });
+});
+
+describe("local ballot store", () => {
+  const ballot = (
+    commitment: Hex,
+    outcome: 0 | 1 | 2 = 0,
+    createdAt = "2026-10-26T12:00:00.000Z",
+  ): TaskV2Ballot => ({
+    version: "vapi-tasks-ballot-v1",
+    orderId: V2_WRITE_ORDER,
+    chainId: 84532,
+    resolver: RESOLVER.toLowerCase() as Hex,
+    escrow: ESCROW.toLowerCase() as Hex,
+    i: 0,
+    caseId: CASE_ID,
+    voter: account.address.toLowerCase() as Hex,
+    outcome,
+    toWorker: "0",
+    salt: SALT,
+    commitment,
+    createdAt,
+  });
+
+  it("writes mode 0600 and finds a ballot only by its exact commitment and voter", async () => {
+    const home = await mkdtemp(join(tmpdir(), "vapi-ballots-"));
+    homes.push(home);
+    const sealed = ballot(`0x${"01".repeat(32)}`);
+    const path = await writeTaskV2Ballot(home, sealed);
+    expect(path).toBe(
+      join(
+        home,
+        "tasks",
+        "ballots",
+        "84532",
+        RESOLVER.toLowerCase(),
+        CASE_ID,
+        `${sealed.commitment}.json`,
+      ),
+    );
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    const key = { chainId: 84532, resolver: RESOLVER, caseId: CASE_ID, voter: account.address };
+    await expect(
+      readTaskV2Ballot(home, { ...key, commitment: sealed.commitment }),
+    ).resolves.toEqual(sealed);
+    await expect(
+      readTaskV2Ballot(home, { ...key, commitment: `0x${"02".repeat(32)}` }),
+    ).resolves.toBeUndefined();
+    await expect(
+      readTaskV2Ballot(home, { ...key, voter: OTHER, commitment: sealed.commitment }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("lists every sealed ballot of a round, oldest first", async () => {
+    const home = await mkdtemp(join(tmpdir(), "vapi-ballots-"));
+    homes.push(home);
+    await writeTaskV2Ballot(home, ballot(`0x${"ff".repeat(32)}`, 1, "2026-10-26T12:00:00.000Z"));
+    await writeTaskV2Ballot(home, ballot(`0x${"00".repeat(31)}01`, 0, "2026-10-26T12:05:00.000Z"));
+    const listed = await listTaskV2Ballots(home, {
+      chainId: 84532,
+      resolver: RESOLVER,
+      caseId: CASE_ID,
+    });
+    expect(listed.map((b) => b.outcome)).toEqual([1, 0]);
+  });
+});
+
+describe("V2 vote commit and reveal", () => {
+  it("seals the ballot before the commit plan is requested and sends only the commitment", async () => {
+    const f = await fixture();
+    let sealedBeforePlan = false;
+    f.client.prepareV2.mockImplementationOnce(async (_id, write) => {
+      f.writes.push(write);
+      const ballots = await listTaskV2Ballots(f.home, {
+        chainId: 84532,
+        resolver: RESOLVER,
+        caseId: CASE_ID,
+      });
+      sealedBeforePlan =
+        ballots.length === 1 &&
+        write.action === "commit-vote" &&
+        ballots[0]!.commitment === write.commitment;
+      return operation(hostedPlan(write));
+    });
+    const result = await runTaskV2Vote(f.context, {
+      ...f.base,
+      i: 0,
+      action: "commit",
+      outcome: "split",
+      toWorker: "40000000",
+    });
+    expect(sealedBeforePlan).toBe(true);
+    expect(result).toMatchObject({ ok: true, ballot: { caseId: CASE_ID } });
+    const write = f.writes[0]!;
+    expect(write).toEqual({ action: "commit-vote", i: 0, commitment: result.ballot.commitment });
+    expect(JSON.stringify(write)).not.toContain(SALT.slice(2));
+    expect(result.ballot.commitment).toBe(
+      fakeCommitment([ESCROW, 0, account.address, 2, 40000000n, SALT]),
+    );
+    const stored = JSON.parse(await readFile(result.ballot.path, "utf8")) as TaskV2Ballot;
+    expect(stored).toMatchObject({ outcome: 2, toWorker: "40000000", salt: SALT });
+  });
+
+  it("keeps a revealable ballot after a crash between the write and the plan", async () => {
+    const f = await fixture();
+    f.client.prepareV2.mockRejectedValueOnce(new Error("network down"));
+    await expect(
+      runTaskV2Vote(f.context, { ...f.base, i: 0, action: "commit", outcome: "poster" }),
+    ).rejects.toThrow();
+    const [ballot] = await listTaskV2Ballots(f.home, {
+      chainId: 84532,
+      resolver: RESOLVER,
+      caseId: CASE_ID,
+    });
+    expect(ballot).toMatchObject({ outcome: 1, toWorker: "0" });
+    // The commit mined from another attempt with that sealed ballot; reveal finds it.
+    f.chain.commitment = ballot!.commitment;
+    const result = await runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" });
+    expect(result).toMatchObject({ ok: true, ballot: { outcome: "poster" } });
+    expect(f.writes.at(-1)).toEqual({
+      action: "reveal-vote",
+      i: 0,
+      outcome: 1,
+      toWorker: "0",
+      salt: SALT,
+    });
+  });
+
+  it("reveals the ballot matching the onchain commitment and ignores a replaced one", async () => {
+    const f = await fixture();
+    const jury = createTaskV2Jury({
+      ...f.options,
+      randomBytes: (n) => new Uint8Array(n).fill(0x11),
+    });
+    const replaced = await jury.sealBallot({ id: V2_WRITE_ORDER, i: 0, outcome: 0, toWorker: "0" });
+    const mined = await createTaskV2Jury(f.options).sealBallot({
+      id: V2_WRITE_ORDER,
+      i: 0,
+      outcome: 1,
+      toWorker: "0",
+    });
+    expect(replaced.ballot.commitment).not.toBe(mined.ballot.commitment);
+    f.chain.commitment = mined.ballot.commitment;
+    await runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" });
+    expect(f.writes.at(-1)).toMatchObject({ action: "reveal-vote", outcome: 1, salt: SALT });
+  });
+
+  it("refuses to reveal without a commitment or without the matching local ballot", async () => {
+    const f = await fixture();
+    await expect(
+      runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" }),
+    ).rejects.toMatchObject({
+      code: "no_commitment",
+    });
+    f.chain.commitment = `0x${"de".repeat(32)}`;
+    await expect(
+      runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" }),
+    ).rejects.toMatchObject({
+      code: "ballot_unavailable",
+    });
+    expect(f.client.prepareV2).not.toHaveBeenCalled();
+  });
+
+  it("validates vote arguments before any chain read", async () => {
+    const f = await fixture();
+    for (const input of [
+      { action: "commit" as const },
+      { action: "commit" as const, outcome: "split" as const },
+      { action: "commit" as const, outcome: "worker" as const, toWorker: "5" },
+      { action: "reveal" as const, outcome: "worker" as const },
+    ])
+      await expect(runTaskV2Vote(f.context, { ...f.base, i: 0, ...input })).rejects.toMatchObject({
+        code: "invalid_input",
+      });
+    expect(f.rpc.readContract).not.toHaveBeenCalled();
+  });
+
+  it("refuses a second, different commit in the same round", async () => {
+    const f = await fixture();
+    f.chain.commitment = `0x${"de".repeat(32)}`;
+    await expect(
+      runTaskV2Vote(f.context, { ...f.base, i: 0, action: "commit", outcome: "worker" }),
+    ).rejects.toMatchObject({ code: "already_committed" });
+  });
+});
+
+describe("V2 jury, bond and owed steps", () => {
+  it("repeats open while the case is Snapshotting", async () => {
+    const f = await fixture();
+    f.chain.caseStates = [6, 6, 3];
+    const result = await runTaskV2Jury(f.context, { ...f.base, i: 0, step: "open" });
+    expect(result).toMatchObject({ ok: true, rounds: 3, caseState: "JuryDrawPending" });
+    expect(f.writes).toEqual(Array(3).fill({ action: "open-jury", i: 0 }));
+  });
+
+  it("runs draw without moving USDC", async () => {
+    const f = await fixture();
+    const result = await runTaskV2Jury(f.context, { ...f.base, i: 0, step: "draw" });
+    expect(result).toMatchObject({ ok: true, rounds: 1, money: { gross: { baseUnits: "0" } } });
+    expect(f.writes).toEqual([{ action: "draw-jury", i: 0 }]);
+  });
+
+  it("reserves the agreed bond before approving the verified clone", async () => {
+    const f = await fixture({ worker: zeroAddress, workerBondBp: 1000 });
+    const execute = createTaskV2Executor(f.options);
+    const result = await execute({ ...f.base, write: { action: "approve-bond" } });
+    expect(result).toMatchObject({ ok: true, money: { gross: { baseUnits: "10000000" } } });
+    const ledger = await readSpendLedger(
+      f.base.ledgerPath,
+      new Date("2026-10-26T12:00:00Z"),
+      "juror" as WalletName,
+    );
+    expect(JSON.stringify(ledger)).toContain("10000000");
+  });
+
+  it("claims owed credit to the caller by default", async () => {
+    const f = await fixture();
+    const execute = createTaskV2Executor(f.options);
+    const result = await execute({ ...f.base, write: { action: "claim-owed" } });
+    expect(result).toMatchObject({ ok: true, money: { gross: { baseUnits: "5000000" } } });
+    f.chain.owed = 0n;
+    await expect(
+      execute({ ...f.base, write: { action: "claim-owed", to: OTHER } }),
+    ).rejects.toMatchObject({
+      code: "nothing_owed",
+    });
+  });
+});
+
+describe("reviewer status from local RPC reads", () => {
+  it("reads the seat, vAPI ID, stake against the gate threshold and resolver flags", async () => {
+    const STAKING = getAddress(`0x${"5e".repeat(20)}`);
+    const reads: string[] = [];
+    const rpc = {
+      getChainId: vi.fn(async () => 84532),
+      readContract: vi.fn(async (call: { functionName: string; address: string }) => {
+        reads.push(`${call.address}:${call.functionName}`);
+        return (
+          {
+            disputeResolver: RESOLVER,
+            registry: OTHER,
+            vapiId: POSTER,
+            stakeGate: ESCROW,
+            staking: STAKING,
+            isReviewer: true,
+            hasId: true,
+            stakedBalance: 900n,
+            threshold: 1000n,
+            isEligible: false,
+            available: true,
+            suspended: false,
+            claimable: 7n,
+            missedReveals: 1,
+          } as Record<string, unknown>
+        )[call.functionName];
+      }),
+    };
+    const status = await readTaskV2ReviewerStatus({
+      chainId: 84532,
+      wallet: account.address,
+      rpcFor: () => rpc as unknown as PublicClient,
+      trustedV2Deployments: { 84532: PIN },
+      onV2UntrustedOverride: () => {},
+    });
+    expect(status).toMatchObject({
+      resolver: RESOLVER,
+      isReviewer: true,
+      hasId: true,
+      staked: "900",
+      threshold: "1000",
+      meetsStake: false,
+      available: true,
+      suspended: false,
+      claimable: "7",
+      missedReveals: 1,
+      ready: false,
+    });
+    expect(reads).toContain(`${FACTORY}:disputeResolver`);
+    expect(reads).toContain(`${STAKING}:stakedBalance`);
+  });
+
+  it("prefers a local resolver pin over the factory getter", async () => {
+    const rpc = {
+      getChainId: vi.fn(async () => 84532),
+      readContract: vi.fn(async (call: { functionName: string }) => {
+        if (call.functionName === "disputeResolver") throw new Error("not on this factory");
+        return ["isReviewer", "hasId", "isEligible", "available", "suspended"].includes(
+          call.functionName,
+        )
+          ? false
+          : ["stakedBalance", "threshold", "claimable"].includes(call.functionName)
+            ? 0n
+            : call.functionName === "missedReveals"
+              ? 0
+              : OTHER;
+      }),
+    };
+    const status = await readTaskV2ReviewerStatus({
+      chainId: 84532,
+      wallet: account.address,
+      rpcFor: () => rpc as unknown as PublicClient,
+      env: {},
+      trustedV2Deployments: { 84532: { ...PIN, disputeResolverV3: RESOLVER } },
+      onV2UntrustedOverride: () => {},
+    });
+    expect(status.resolver).toBe(RESOLVER);
+    await expect(
+      readTaskV2ReviewerStatus({
+        chainId: 84532,
+        wallet: account.address,
+        rpcFor: () => rpc as unknown as PublicClient,
+        trustedV2Deployments: { 84532: PIN },
+        onV2UntrustedOverride: () => {},
+      }),
+    ).rejects.toMatchObject({ code: "v2_resolver_unavailable" });
+  });
+});
+
+describe("ballot path helper", () => {
+  it("keys ballots by chain, resolver, case and commitment", () => {
+    expect(
+      taskV2BallotPath("/h", {
+        chainId: 1,
+        resolver: RESOLVER,
+        caseId: CASE_ID,
+        commitment: CASE_ID,
+      }),
+    ).toBe(join("/h", "tasks", "ballots", "1", RESOLVER.toLowerCase(), CASE_ID, `${CASE_ID}.json`));
+  });
+});

@@ -1,5 +1,7 @@
-import { escrowV2Abi, bountyPoolV1Abi } from "./v2-abi.js";
+import { escrowV2Abi, bountyPoolV1Abi, escrowV2OwedAbi } from "./v2-abi.js";
 import {
+  acceptedV2WorkerBond,
+  isV2ResolverAction,
   v2Read,
   verifyV2Target,
   verifyV2Plan,
@@ -250,13 +252,32 @@ export function createTaskV2Executor(options: TasksChainOptions) {
         );
         gross = settlement.gross;
         feeBp = settlement.toWorker ? target.feeBp : 0;
+      } else if (isV2ResolverAction(action)) {
+        // Jury and vote steps move no USDC from the acting wallet.
+        feeBp = 0;
+      } else if (action.action === "approve-bond") {
+        // The bond leaves this wallet when the poster awards, so the approval is the spend.
+        pays = gross = acceptedV2WorkerBond(target, view);
+        feeBp = 0;
+      } else if (action.action === "claim-owed") {
+        gross = BigInt(
+          String(
+            await v2Read(target.rpc, target.escrow, escrowV2OwedAbi, "owed", [account.address]),
+          ),
+        );
+        if (gross === 0n)
+          throw new TaskOperationError(
+            "nothing_owed",
+            "The verified escrow owes this wallet nothing.",
+          );
+        feeBp = 0;
       }
       if (gross > 0n && feeBp === null)
         fail("Hosted gross, fee and net are unavailable; refusing to sign.");
       // Running payouts must use their immutable fee snapshot, never today's deployment rate.
       if (
         gross > 0n &&
-        !["fund", "cancel-offer", "expire"].includes(action.action) &&
+        !["fund", "cancel-offer", "expire", "approve-bond", "claim-owed"].includes(action.action) &&
         !state.success
       )
         fail("Hosted V2 fee snapshot is unavailable; refusing to sign.");
@@ -322,7 +343,10 @@ export function createTaskV2Executor(options: TasksChainOptions) {
       const beforeSign = async () => {
         if (reserved || pays === 0n) return;
         await reserveSpend(pays, input.caps, {
-          kind: action.action === "fund" ? "escrow-funding" : "dispute-fee",
+          kind:
+            action.action === "fund" || action.action === "approve-bond"
+              ? "escrow-funding"
+              : "dispute-fee",
           taskKey: input.id,
           maxPerTaskAtomic: taskPolicyAtomic(input.policy.maxPerTaskUsd),
           wallet: input.wallet,
@@ -368,7 +392,9 @@ export function createTaskV2Executor(options: TasksChainOptions) {
         }
         let result = taskV2OperationResponseSchema.parse(current);
         const operationId = result.operation.id;
-        const finalStep = `v2-${action.action}`;
+        // A worker bond is only a USDC approval of the verified clone.
+        const finalStep =
+          action.action === "approve-bond" ? "v2-approve-usdc" : `v2-${action.action}`;
         const allowedSteps =
           action.action === "fund"
             ? ["v2-create-pool", "v2-approve-usdc", "v2-fund"]

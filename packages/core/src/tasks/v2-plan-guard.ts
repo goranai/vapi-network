@@ -25,6 +25,8 @@ import {
   escrowV2Abi,
   bountyPoolV1Abi,
   disputeResolverV3Abi,
+  disputeResolverV3JuryAbi,
+  escrowV2OwedAbi,
 } from "./v2-abi.js";
 import { getTrustedTasksV2Deployment, type TasksV2Deployment } from "./v2-trust.js";
 import {
@@ -386,6 +388,20 @@ function verifyActor(
     case "refund":
       permitted = isWorker;
       break;
+    case "approve-bond":
+      // The awarded or intended worker approves its own bond; never the poster.
+      permitted = !isPoster && (worker === undefined || worker === zeroAddress || isWorker);
+      break;
+    case "open-jury":
+    case "draw-jury":
+    case "rearm-draw":
+    case "resolve":
+    case "commit-vote":
+    case "reveal-vote":
+    case "claim-owed":
+      // Permissionless on-chain: the resolver checks seats and the escrow pays only the caller's credit.
+      permitted = true;
+      break;
     case "raise-dispute":
     case "counter-evidence":
     case "split":
@@ -409,7 +425,8 @@ function verifyActor(
 /** The API supplies candidates; only local pins and trusted RPC reads establish trust. */
 export async function verifyV2Target(
   options: TasksChainOptions,
-  current: TaskV2Prepared,
+  /** A hosted response, or only the hosted chain ID before any plan exists (ballot sealing). */
+  current: TaskV2Prepared | { chainId: number },
   view: GetOrderResponse,
   action: TaskV2Action | TaskV2Consent,
   knownTarget?: Address,
@@ -418,7 +435,9 @@ export async function verifyV2Target(
   const intent = taskV2IntentSchema.safeParse(current);
   const chainId = operation.success
     ? operation.data.operation.plan.chainId
-    : intent.data!.typedData.domain.chainId;
+    : intent.success
+      ? intent.data.typedData.domain.chainId
+      : z.object({ chainId: z.number().int().positive() }).parse(current).chainId;
   const pin = getTrustedTasksV2Deployment(chainId, {
     overrides: options.trustedV2Deployments,
     env: options.env,
@@ -722,6 +741,51 @@ export async function verifyV2TypedData(
   }
 }
 
+export const V2_RESOLVER_ACTIONS = [
+  "open-jury",
+  "draw-jury",
+  "rearm-draw",
+  "resolve",
+  "commit-vote",
+  "reveal-vote",
+] as const;
+export type TaskV2ResolverAction = Extract<
+  TaskV2Action,
+  { action: (typeof V2_RESOLVER_ACTIONS)[number] }
+>;
+export function isV2ResolverAction(
+  action: TaskV2Action | TaskV2Consent,
+): action is TaskV2ResolverAction {
+  return (V2_RESOLVER_ACTIONS as readonly string[]).includes(action.action);
+}
+
+/**
+ * The resolver trust chain: DISPUTE_RESOLVER() is an immutable on the clone that
+ * verifyV2Target proved against the pinned factory. A local resolver pin must agree.
+ */
+export async function verifiedV2Resolver(target: VerifiedV2Target) {
+  if (target.pool) return v2GuardFailure("Jury steps apply only to a verified task escrow.");
+  const resolver = address.parse(
+    await v2Read(target.rpc, target.escrow, escrowV2OwedAbi, "DISPUTE_RESOLVER"),
+  );
+  if (
+    resolver === zeroAddress ||
+    (target.pin.disputeResolverV3 && !same(resolver, target.pin.disputeResolverV3))
+  )
+    return v2GuardFailure("The verified escrow's dispute resolver differs from the local pin.");
+  return resolver;
+}
+
+/** The agreed worker bond: on-chain principal × accepted workerBondBp / 10,000 (EscrowV2.award). */
+export function acceptedV2WorkerBond(target: VerifiedV2Target, view: GetOrderResponse) {
+  const bp = z
+    .object({ workerBondBp: z.number().int().min(0).max(2000).optional() })
+    .safeParse(view.workOrder.terms).data?.workerBondBp;
+  if (target.pool || !bp || target.milestones.length !== 1)
+    return v2GuardFailure("The accepted task terms carry no worker bond.");
+  return (target.milestones.reduce((sum, m) => sum + m.amount, 0n) * BigInt(bp)) / 10_000n;
+}
+
 /** Decode every step, bind selector/arguments/destination to the requested action. */
 export async function verifyV2Plan(
   target: VerifiedV2Target,
@@ -735,12 +799,13 @@ export async function verifyV2Plan(
     return v2GuardFailure("V2 plan value or chain mismatch.");
   if (plan.step === "v2-approve-usdc") {
     if (
-      !["fund", "raise-dispute", "counter-evidence"].includes(action.action) ||
+      !["fund", "raise-dispute", "counter-evidence", "approve-bond"].includes(action.action) ||
       !same(plan.to, target.pin.usdc)
     )
       return v2GuardFailure("Unexpected USDC approval step or destination.");
     const decoded = decodeFunctionData({ abi: approvalAbi, data: plan.data });
-    // C0 task funding approves the pinned factory; pools and dispute fees approve the verified clone.
+    // C0 task funding approves the pinned factory; pools, dispute fees and the worker bond
+    // approve the verified clone.
     const spender = action.action === "fund" && !target.pool ? target.factory : target.escrow;
     if (!same(decoded.args[0], spender) || decoded.args[1] !== pays)
       return v2GuardFailure("USDC approval spender or amount mismatch.");
@@ -783,8 +848,65 @@ export async function verifyV2Plan(
       return v2GuardFailure("Unexpected factory funding authorization.");
     return;
   }
+  if (action.action === "approve-bond")
+    return v2GuardFailure("A worker bond approval must be a USDC approval step.");
+  // Normalize addresses only; never encode or modify the prepared calldata.
+  const normalize = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(normalize)
+      : typeof v === "string" && /^0x[0-9a-fA-F]{40}$/u.test(v)
+        ? getAddress(v)
+        : v;
+  const bind = (
+    decoded: { functionName: string; args?: readonly unknown[] },
+    names: string[],
+    expected: readonly unknown[],
+  ) => {
+    if (
+      !names.includes(decoded.functionName) ||
+      argumentJson(normalize(decoded.args ?? [])) !== argumentJson(normalize(expected))
+    )
+      v2GuardFailure("V2 calldata selector or arguments differ from the user's action.");
+  };
+  if (isV2ResolverAction(action)) {
+    const resolver = await verifiedV2Resolver(target);
+    if (!same(plan.to, resolver) || plan.step !== `v2-${action.action}`)
+      return v2GuardFailure(
+        "Jury plan step or destination differs from the verified escrow's dispute resolver.",
+      );
+    const decoded = decodeFunctionData({ abi: disputeResolverV3JuryAbi, data: plan.data });
+    const at = [target.escrow, action.i] as const;
+    switch (action.action) {
+      case "open-jury":
+        // A registry larger than one snapshot batch continues the same open step.
+        return bind(decoded, ["openJury", "continueJury"], at);
+      case "draw-jury":
+        return bind(decoded, ["drawJury"], at);
+      case "rearm-draw":
+        return bind(decoded, ["rearmDraw"], at);
+      case "resolve":
+        return bind(decoded, ["resolve"], at);
+      case "commit-vote":
+        return bind(decoded, ["commitVote"], [...at, action.commitment]);
+      case "reveal-vote":
+        return bind(
+          decoded,
+          ["revealVote"],
+          [...at, action.outcome, BigInt(action.toWorker), action.salt],
+        );
+    }
+  }
   if (!same(plan.to, target.escrow) || plan.step !== `v2-${action.action}`)
     return v2GuardFailure("V2 step or destination differs from the requested verified target.");
+  if (action.action === "claim-owed") {
+    if (target.pool) return v2GuardFailure("Owed credits are claimed from a task escrow.");
+    // plan.from is bound to the operation's expected actor, which the executor binds to the wallet.
+    return bind(
+      decodeFunctionData({ abi: escrowV2OwedAbi, data: plan.data }),
+      ["claimOwed"],
+      [getAddress(action.to ?? plan.from)],
+    );
+  }
   const decoded = decodeFunctionData({
     abi: target.pool ? bountyPoolV1Abi : escrowV2Abi,
     data: plan.data,
@@ -860,13 +982,6 @@ export async function verifyV2Plan(
     default:
       return v2GuardFailure("Unknown participant action or selector.");
   }
-  // Normalize addresses only; never encode or modify the prepared calldata.
-  const normalize = (v: unknown): unknown =>
-    Array.isArray(v)
-      ? v.map(normalize)
-      : typeof v === "string" && /^0x[0-9a-fA-F]{40}$/u.test(v)
-        ? getAddress(v)
-        : v;
   if (
     decoded.functionName !== name ||
     argumentJson(normalize(args)) !== argumentJson(normalize(expected))
