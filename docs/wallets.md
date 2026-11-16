@@ -175,6 +175,12 @@ A restored leg requires extra review. Check its sender balance and explorer hist
 
 The ceiling is 5 USDC for new and existing accounts unless the terminal sets another value. `--ceiling off` disables automatic sweeps. An automatic ceiling sweep returns funds to the linked owner, or to the treasury for a swarm member, and never lowers the account below its per-day cap. Automatic ceiling enforcement and `vapi sweep` refuse to sign while an open movement leg from that account may still settle. Resume the movement first. If it cannot resume, wait for any signed authorization to expire and cancel it from the terminal.
 
+Sent ETH by mistake? The wallet keeps the ETH you sent on Base. Send it back minus the Base network fee; a tiny amount may stay behind.
+
+```sh
+vapi sweep <your-address> --asset eth
+```
+
 The `--all` flag shows every account of the same owner, including accounts on other devices. Rows from other devices are read-only, and no command acts on them. The default account's link supplies the agent bearer, or the first linked local account does when the default is not linked. If no local account is linked, the command prints the local accounts and tells you to run `vapi login`. The request sends only the agent bearer; keys and phrases stay on the machine. With `--all --json`, the object contains `accounts` and `siblings`, plus `siblingsError` when the remote read fails.
 
 Wallet commands accept this selector:

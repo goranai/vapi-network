@@ -3,7 +3,7 @@ import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
-import type { Address } from "viem";
+import { formatEther, type Address } from "viem";
 
 import {
   BASE_MAINNET_CAIP2,
@@ -63,6 +63,8 @@ import {
   SweepGasError,
   TransferError,
   sweepBack,
+  sweepNativeEth,
+  supportsNativeEthSweep,
   unlockProtectedVault,
   usesUsdcGas,
   validatePrivateKey,
@@ -237,7 +239,8 @@ Usage:
   vapi receipts [--limit <n>] [--account <name>] [--all-wallets] [--json]
   vapi receipts export --format <json|csv> [--range <24h|7d|30d>] [--account <name>] [--all-wallets]
   vapi stats [--range <24h|7d|30d>] [--account <name>] [--all-wallets] [--json]
-  vapi sweep [<address>] [--network <caip2>] [--account <name>] [--json]
+  vapi sweep [<address>] [--asset usdc|eth] [--network <caip2>] [--account <name>] [--json]
+    --asset eth moves the wallet's ETH on Base minus the network fee.
   vapi agent create <name> --model <id> --instructions <file> [--call-budget <usd>] [--max-per-call <usd>] [--router-budget <usd>] [--approve-above <usd>] [--max-per-task <usd>] [--auto-release-below <usd>] [--include-unverified] [--max-steps <n>] [--yes] [--json]
   vapi agent run <name> "<task>" [--budget <usd>] [--detach] [--runtime local] [--result-file <path>] [--json]
   vapi agent run --bundle-env <VAR> ("<task>" | --task-base64url <text>) [--budget <usd>] [--result-file <path>] [--json]
@@ -434,6 +437,7 @@ export type CliDependencies = {
   openUrl?: (url: string) => boolean;
   /** Moves a wallet balance, injected for deterministic sweep command tests. */
   sweepBack?: typeof sweepBack;
+  sweepNativeEth?: typeof sweepNativeEth;
   /** Transfer authorization inputs, injected so send tests are deterministic. */
   transfer?: {
     nonce?: TransferArgs["nonce"];
@@ -2026,9 +2030,15 @@ async function sweepCommand(
   dependencies: CliDependencies,
 ): Promise<void> {
   const parsed = parseArguments(argv, {
-    valueOptions: new Set(["--network", WALLET_OPTION]),
+    valueOptions: new Set(["--asset", "--network", WALLET_OPTION]),
     maximumPositionals: 1,
   });
+  const asset = parsed.one("--asset") ?? "usdc";
+  if (asset !== "usdc" && asset !== "eth") {
+    throw new UsageError(
+      "Usage: vapi sweep [<address>] [--asset usdc|eth] [--network <caip2>]\n--asset must be usdc or eth.",
+    );
+  }
   const requestedNetwork = parsed.one("--network");
   const target = await targetWallet(parsed, dependencies);
   const explicitDestination = parsed.positionals[0];
@@ -2065,10 +2075,20 @@ async function sweepCommand(
       | { network: string; status: "swept"; amountAtomic: string; transaction: string }
       | { network: string; status: "error"; error: string }
     > = [];
+    const errors: unknown[] = [];
     const gasErrors: SweepGasError[] = [];
-    for (const network of requestedNetwork ? [requestedNetwork] : Object.keys(config.networks)) {
+    const networks = requestedNetwork
+      ? [requestedNetwork]
+      : Object.keys(config.networks).filter(
+          (network) => asset === "usdc" || supportsNativeEthSweep(network),
+        );
+    for (const network of networks) {
       try {
-        const result = await (dependencies.sweepBack ?? sweepBack)({
+        const sweep =
+          asset === "eth"
+            ? (dependencies.sweepNativeEth ?? sweepNativeEth)
+            : (dependencies.sweepBack ?? sweepBack);
+        const result = await sweep({
           account,
           config,
           network,
@@ -2078,6 +2098,7 @@ async function sweepCommand(
         results.push({ ...result, status: "swept" });
       } catch (error) {
         if (requestedNetwork) throw error;
+        errors.push(error);
         if (error instanceof SweepGasError) gasErrors.push(error);
         results.push({
           network,
@@ -2087,10 +2108,24 @@ async function sweepCommand(
       }
     }
     if (!results.some((result) => result.status === "swept")) {
+      if (asset === "eth") {
+        if (errors.length) throw errors[0];
+        throw new Error("No configured network had a sweepable ETH balance.");
+      }
       if (gasErrors[0]) throw gasErrors[0];
       throw new Error("No configured network had a sweepable USDC balance.");
     }
-    outputForWallet(io, json, target, { results }, formatSweepResults(results, ownerDestination));
+    outputForWallet(
+      io,
+      json,
+      target,
+      {
+        results: asset === "eth" ? results.map((result) => ({ ...result, asset: "eth" })) : results,
+      },
+      asset === "eth"
+        ? formatEthSweepResults(results, destination)
+        : formatSweepResults(results, ownerDestination),
+    );
   });
 }
 
@@ -4065,6 +4100,23 @@ function formatRate(value: number): string {
 
 function formatLatency(value: number | null): string {
   return value === null ? "—" : String(value);
+}
+
+function formatEthSweepResults(
+  results: Parameters<typeof formatSweepResults>[0],
+  destination: string,
+): string {
+  return results
+    .map((result) => {
+      const name = getNetworkDefinition(result.network).name;
+      if (result.status === "error") return `${name}: ${result.error}`;
+      const [whole, fraction] = formatEther(BigInt(result.amountAtomic)).split(".");
+      const decimals = fraction?.slice(0, 8).replace(/0+$/, "");
+      const amount = decimals ? `${whole}.${decimals}` : whole;
+      const url = explorerTransactionUrl(result.network, result.transaction);
+      return `${name}: sent ${amount} ETH to ${destination} in ${result.transaction}${url ? ` (${url})` : ""}`;
+    })
+    .join("\n");
 }
 
 function formatSweepResults(
