@@ -150,9 +150,11 @@ describe("native ETH sweep", () => {
       gasFails?: boolean;
       code?: string;
       reverted?: boolean;
+      gasForValue?: (value: bigint, call: number) => bigint;
     } = {},
   ) {
     const sent: Hex[] = [];
+    const estimatedValues: bigint[] = [];
     const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
       const request = JSON.parse(String(init?.body)) as {
         id: number;
@@ -167,15 +169,18 @@ describe("native ETH sweep", () => {
         case "eth_getBalance":
           result = `0x${(options.balance ?? balance).toString(16)}`;
           break;
-        case "eth_estimateGas":
+        case "eth_estimateGas": {
+          const { value } = request.params[0] as unknown as { value: Hex };
+          estimatedValues.push(BigInt(value));
           if (options.gasFails)
             return Response.json({
               jsonrpc: "2.0",
               id: request.id,
               error: { code: -32000, message: "estimation failed" },
             });
-          result = "0x5208";
+          result = `0x${(options.gasForValue?.(BigInt(value), estimatedValues.length) ?? 21_000n).toString(16)}`;
           break;
+        }
         case "eth_getCode":
           result = options.code ?? "0x";
           break;
@@ -235,7 +240,7 @@ describe("native ETH sweep", () => {
       }
       return Response.json({ jsonrpc: "2.0", id: request.id, result });
     });
-    return { fetchImpl, sent };
+    return { fetchImpl, sent, estimatedValues };
   }
   const args = {
     account: SWEEP_ACCOUNT,
@@ -257,6 +262,63 @@ describe("native ETH sweep", () => {
       maxPriorityFeePerGas: 10n,
     });
   });
+  it("recalculates the reserve and validates the actual value for a contract", async () => {
+    const node = rpc({ code: "0x1234", gasForValue: (value) => (value > 1n ? 80_000n : 21_000n) });
+    const result = await sweepNativeEth({ ...args, fetchImpl: node.fetchImpl });
+    const expectedAmount = balance - ((maxFee * 80_000n + l1Fee) * 120n) / 100n;
+    expect(result.amountAtomic).toBe(expectedAmount.toString());
+    expect(node.estimatedValues).toEqual([1n, balance - fee, expectedAmount]);
+    expect(parseTransaction(node.sent[0]!)).toMatchObject({
+      value: expectedAmount,
+      gas: 80_000n,
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: 10n,
+    });
+  });
+
+  it("does not sign when estimation of the actual contract deposit fails", async () => {
+    const node = rpc({
+      code: "0x1234",
+      gasForValue: (value) => {
+        if (value > 1n) throw new Error("deposit rejected");
+        return 21_000n;
+      },
+    });
+    await expect(sweepNativeEth({ ...args, fetchImpl: node.fetchImpl })).rejects.toThrow(
+      "deposit rejected",
+    );
+    expect(node.sent).toEqual([]);
+  });
+
+  it("fails closed when contract gas estimates keep increasing", async () => {
+    const node = rpc({ code: "0x1234", gasForValue: (_value, call) => BigInt(call) * 21_000n });
+    await expect(sweepNativeEth({ ...args, fetchImpl: node.fetchImpl })).rejects.toThrow(
+      "Could not safely estimate gas",
+    );
+    expect(node.estimatedValues).toHaveLength(6);
+    expect(node.sent).toEqual([]);
+  });
+
+  it.each(["eip155:1", "eip155:137", "eip155:56", "invalid", "solana:mainnet"])(
+    "does not treat %s as Base ETH",
+    (network) => {
+      expect(supportsNativeEthSweep(network)).toBe(false);
+    },
+  );
+
+  it("allows Base mainnet and Sepolia only", () => {
+    expect(supportsNativeEthSweep(BASE_MAINNET_CAIP2)).toBe(true);
+    expect(supportsNativeEthSweep("eip155:84532")).toBe(true);
+  });
+
+  it("rejects a configured non-Base EVM chain before RPC access", async () => {
+    const node = rpc();
+    await expect(
+      sweepNativeEth({ ...args, network: "eip155:1", fetchImpl: node.fetchImpl }),
+    ).rejects.toThrow("Native ETH sweeps are supported only on Base mainnet and Base Sepolia.");
+    expect(node.fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("rejects a balance too small to cover the fee without signing", async () => {
     const node = rpc({ balance: 100n });
     await expect(sweepNativeEth({ ...args, fetchImpl: node.fetchImpl })).rejects.toThrow(
