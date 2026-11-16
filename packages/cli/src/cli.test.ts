@@ -1753,13 +1753,83 @@ describe("vapi sweep destinations", () => {
       linkedAt: "2026-09-23T10:00:00.000Z",
     });
     const sweepBack = successfulSweep();
+    const sweepNativeEth = successfulSweep();
     const captured = captureIo();
 
-    expect(await runCli(["sweep"], captured.io, { sweepBack })).toBe(0);
+    expect(await runCli(["sweep"], captured.io, { sweepBack, sweepNativeEth })).toBe(0);
 
     expect(sweepBack).toHaveBeenCalledOnce();
+    expect(sweepNativeEth).not.toHaveBeenCalled();
     expect(sweepBack.mock.calls[0]![0]).toMatchObject({ destination: owner });
     expect(captured.stdout.join("\n")).toContain(`to your owner wallet ${owner}`);
+  });
+
+  it("sweeps ETH to the linked owner without calling the USDC sweep", async () => {
+    const home = await initializedHome("vapi-cli-sweep-eth-");
+    const store = await WalletStore.open(home, { secrets: sharedSecretStore(home) });
+    await store.setLink("main", {
+      apiBase: "https://api.vapinetwork.ai",
+      clientId: "agent_main",
+      owner,
+      label: "researcher",
+      scopes: ["mcp:call"],
+      linkedAt: "2026-09-23T10:00:00.000Z",
+    });
+    const sweepNativeEth = successfulSweep();
+    const sweepBack = successfulSweep();
+    const captured = captureIo();
+    expect(
+      await runCli(["sweep", "--asset", "eth"], captured.io, { sweepNativeEth, sweepBack }),
+    ).toBe(0);
+    expect(sweepNativeEth).toHaveBeenCalledOnce();
+    expect(sweepNativeEth.mock.calls[0]![0]).toMatchObject({
+      destination: owner,
+      network: BASE_MAINNET_CAIP2,
+    });
+    expect(sweepBack).not.toHaveBeenCalled();
+    expect(captured.stdout.join("\n")).toContain("sent");
+    expect(captured.stdout.join("\n")).toContain(`ETH to ${owner}`);
+  });
+
+  it("skips Arc and labels ETH JSON results", async () => {
+    await initializedHome("vapi-cli-sweep-eth-networks-");
+    expect(await runCli(["accounts", "--enable", "arc", "--json"], captureIo().io)).toBe(0);
+    const sweepNativeEth = successfulSweep();
+    const captured = captureIo();
+    expect(
+      await runCli(["sweep", explicit, "--asset", "eth", "--json"], captured.io, {
+        sweepNativeEth,
+      }),
+    ).toBe(0);
+    expect(sweepNativeEth).toHaveBeenCalledOnce();
+    expect(sweepNativeEth.mock.calls[0]![0].network).toBe(BASE_MAINNET_CAIP2);
+    expect(JSON.parse(captured.stdout[0]!).results).toEqual([
+      expect.objectContaining({ asset: "eth", status: "swept" }),
+    ]);
+  });
+
+  it("surfaces the first ETH failure when no network succeeds", async () => {
+    await initializedHome("vapi-cli-sweep-eth-failure-");
+    const sweepNativeEth = vi.fn<NonNullable<CliDependencies["sweepNativeEth"]>>(async () => {
+      throw new Error("ETH balance too small");
+    });
+    const captured = captureIo();
+    expect(
+      await runCli(["sweep", explicit, "--asset", "eth"], captured.io, { sweepNativeEth }),
+    ).toBe(1);
+    expect(captured.stderr).toEqual(["ETH balance too small"]);
+  });
+
+  it("rejects an invalid asset before opening a wallet", async () => {
+    const sweepNativeEth = successfulSweep();
+    const sweepBack = successfulSweep();
+    const captured = captureIo();
+    expect(
+      await runCli(["sweep", "--asset", "doge"], captured.io, { sweepNativeEth, sweepBack }),
+    ).toBe(2);
+    expect(captured.stderr.join("\n")).toContain("--asset must be usdc or eth.");
+    expect(sweepNativeEth).not.toHaveBeenCalled();
+    expect(sweepBack).not.toHaveBeenCalled();
   });
 
   it("keeps the usage error when no address or link exists", async () => {
@@ -1784,71 +1854,83 @@ describe("vapi sweep destinations", () => {
     expect(captured.stdout.join("\n")).not.toContain("your owner wallet");
   });
 
-  it("refuses a manual sweep while a signed failed movement may still settle", async () => {
-    const home = await initializedHome("vapi-cli-sweep-open-movement-");
-    const payer = await accountAddress(home);
-    const nonce = `0x${"12".repeat(32)}` as const;
-    const movementId = "mv_manualsweep1";
-    await mkdir(join(home, "movements"), { recursive: true });
-    await writeFile(
-      join(home, "movements", `${movementId}.json`),
-      `${JSON.stringify({
-        v: 2,
-        id: movementId,
-        reason: "sweep",
-        from: "main",
-        network: BASE_MAINNET_CAIP2,
-        createdAt: "2026-09-30T10:00:00.000Z",
-        legs: [
-          {
-            from: "main",
+  it.each(["usdc", "eth"])(
+    "refuses a manual %s sweep while a signed failed movement may still settle",
+    async (asset) => {
+      const home = await initializedHome("vapi-cli-sweep-open-movement-");
+      const payer = await accountAddress(home);
+      const nonce = `0x${"12".repeat(32)}` as const;
+      const movementId = "mv_manualsweep1";
+      await mkdir(join(home, "movements"), { recursive: true });
+      await writeFile(
+        join(home, "movements", `${movementId}.json`),
+        `${JSON.stringify({
+          v: 2,
+          id: movementId,
+          reason: "sweep",
+          from: "main",
+          network: BASE_MAINNET_CAIP2,
+          createdAt: "2026-09-30T10:00:00.000Z",
+          legs: [
+            {
+              from: "main",
+              to: owner,
+              fromAddress: payer,
+              toAddress: owner,
+              amountUsd: "10.00",
+              purpose: "sweep",
+              nonce,
+              status: "failed",
+              reason: "relay_limit",
+            },
+          ],
+        })}\n`,
+        "utf8",
+      );
+      await appendReceipt(
+        {
+          id: "signed-failed-manual-sweep",
+          timestamp: "2026-09-30T10:00:01.000Z",
+          kind: "transfer",
+          wallet: "main",
+          resourceUrl: "https://api.vapinetwork.ai/api/agents/relay-transfer",
+          method: "POST",
+          quote: { network: BASE_MAINNET_CAIP2, amountAtomic: "10000000", payTo: owner },
+          payer,
+          transfer: {
             to: owner,
-            fromAddress: payer,
-            toAddress: owner,
-            amountUsd: "10.00",
-            purpose: "sweep",
+            toName: "owner",
+            toKind: "owner",
+            amountAtomic: "10000000",
+            network: BASE_MAINNET_CAIP2,
             nonce,
             status: "failed",
-            reason: "relay_limit",
+            txHash: null,
+            replayed: false,
           },
-        ],
-      })}\n`,
-      "utf8",
-    );
-    await appendReceipt(
-      {
-        id: "signed-failed-manual-sweep",
-        timestamp: "2026-09-30T10:00:01.000Z",
-        kind: "transfer",
-        wallet: "main",
-        resourceUrl: "https://api.vapinetwork.ai/api/agents/relay-transfer",
-        method: "POST",
-        quote: { network: BASE_MAINNET_CAIP2, amountAtomic: "10000000", payTo: owner },
-        payer,
-        transfer: {
-          to: owner,
-          toName: "owner",
-          toKind: "owner",
-          amountAtomic: "10000000",
-          network: BASE_MAINNET_CAIP2,
-          nonce,
-          status: "failed",
-          txHash: null,
-          replayed: false,
+          settlement: { outcome: "rejected" },
+          error: { code: "relay_limit", message: "relay limit" },
         },
-        settlement: { outcome: "rejected" },
-        error: { code: "relay_limit", message: "relay limit" },
-      },
-      getVapiPaths(home).receipts,
-      { wallet: "main" },
-    );
-    const sweepBack = successfulSweep();
-    const captured = captureIo();
+        getVapiPaths(home).receipts,
+        { wallet: "main" },
+      );
+      const sweepBack = successfulSweep();
+      const sweepNativeEth = successfulSweep();
+      const captured = captureIo();
 
-    expect(await runCli(["sweep", explicit], captured.io, { sweepBack })).toBe(1);
-    expect(sweepBack).not.toHaveBeenCalled();
-    expect(captured.stderr.join("\n")).toContain(`vapi accounts distribute --resume ${movementId}`);
-  });
+      expect(
+        await runCli(["sweep", explicit, "--asset", asset], captured.io, {
+          sweepBack,
+          sweepNativeEth,
+        }),
+      ).toBe(1);
+      expect(sweepBack).not.toHaveBeenCalled();
+      expect(sweepNativeEth).not.toHaveBeenCalled();
+      expect(captured.stderr.join("\n")).toContain(
+        `vapi accounts distribute --resume ${movementId}`,
+      );
+    },
+  );
 
   it("prints a friendly gas error for an explicit network", async () => {
     const home = await initializedHome("vapi-cli-sweep-gas-");
