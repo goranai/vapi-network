@@ -5,6 +5,12 @@ scoped packages. The packages share one version and are released together.
 
 ## Unreleased
 
+## 0.14.0 — 2026-11-17
+
+### Added
+
+- `vapi sweep --asset eth` sends an account's ETH on Base back to an address, or to the linked owner when no address is given. It keeps the Base network fee (gas plus the L1 data fee, with a 20% margin) and checks gas for the exact amount before signing. It works on Base and Base Sepolia only; Arc and Solana are refused. Without `--asset`, `vapi sweep` moves USDC exactly as before.
+
 ## 0.13.0 — 2026-11-10
 
 ### Added

@@ -22,7 +22,7 @@ vAPI Network is not related to Vapi.ai, the voice AI company.
 
 ## Install
 
-This README describes client 0.13.0. `npm view vapi-network version` shows the latest published release.
+This README describes client 0.14.0. `npm view vapi-network version` shows the latest published release.
 
 ```bash
 npm i -g vapi-network
