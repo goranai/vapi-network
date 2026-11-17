@@ -1364,7 +1364,8 @@ describe("plain show and status keep unrevealed ballots out (hosted echoes)", ()
     };
     expect(leaks(result)).toEqual(clean);
     expect(result.events?.map((e) => e.sequence)).toEqual([1, 2]);
-    expect(result.events?.[0]!.payload).toEqual(revealed);
+    // Outside v2State a ballot-shaped object loses its vote, even a revealed one.
+    expect(result.events?.[0]!.payload).toEqual({ reviewer: ADDRESS, revealed: true });
     expect(result.chainState).toMatchObject({ workOrderId: ID, observedAt: NOW });
   });
 
@@ -1393,6 +1394,78 @@ describe("plain show and status keep unrevealed ballots out (hosted echoes)", ()
             ? { code: "echo", message: expect.stringContaining("(HTTP 500)") }
             : { code: "network", message: expect.stringContaining("withheld") },
         );
+      }
+  });
+
+  it("redacts stringified and unlabelled ballot echoes but keeps tx hashes and v2State votes", async () => {
+    const TX = `0x${"9c".repeat(32)}`;
+    const stringified = JSON.stringify({ salt: SALT, outcome: 2, toWorker: SPLIT });
+    const { fetch } = recordedFetch(
+      json({
+        workOrder: {
+          ...privateOrder,
+          debug: stringified,
+          note: `retry with salt=${SALT}`,
+          pending: { salt: SALT, outcome: 2, toWorker: SPLIT },
+          sealed: { outcome: 1, commitment: HASH },
+          lastTransactionHash: TX,
+          v2State: { escrow: ADDRESS, votes: [revealed], raw: stringified },
+        },
+      }),
+      json({
+        workOrderId: ID,
+        milestones: [],
+        observedAt: NOW,
+        transactionHash: TX,
+        log: [stringified, { toWorker: SPLIT, vote: "split" }],
+      }),
+      json({ events: [], nextAfter: 0 }),
+    );
+    const shown = (await showTask(context(fetch), { id: ID, signedIn: true })) as unknown as {
+      workOrder: Record<string, unknown>;
+    };
+    expect(shown.workOrder).toMatchObject({
+      debug: "[redacted]",
+      note: "[redacted]",
+      pending: {},
+      sealed: { commitment: HASH },
+      lastTransactionHash: TX,
+      v2State: { escrow: ADDRESS, votes: [revealed], raw: stringified },
+    });
+    expect(JSON.stringify({ ...shown.workOrder, v2State: null })).not.toContain(SPLIT);
+    const status = (await taskStatus(context(fetch), { id: ID, signedIn: true })) as {
+      chainState: Record<string, unknown>;
+    };
+    expect(status.chainState).toMatchObject({
+      transactionHash: TX,
+      log: ["[redacted]", { vote: "split" }],
+    });
+    expect(JSON.stringify(status)).not.toContain(SPLIT);
+  });
+
+  it("withholds outcome-only ballot messages and unsafe server codes in show and status", async () => {
+    const cases = [
+      { code: "echo", message: "Pending ballot outcome: 2", expected: "echo" },
+      { code: "a5".repeat(32), message: "Server error", expected: "http_500" },
+      { code: SALT.slice(2), message: "Server error", expected: "http_500" },
+      { code: "Vote-Echo.1", message: "Server error", expected: "http_500" },
+    ];
+    for (const read of ["show", "status"] as const)
+      for (const item of cases) {
+        const fetch = vi.fn(async () =>
+          json({ error: { code: item.code, message: item.message } }, { status: 500 }),
+        ) as unknown as typeof globalThis.fetch;
+        const error = (await (
+          read === "show"
+            ? showTask(context(fetch), { id: ID, signedIn: true })
+            : taskStatus(context(fetch), { id: ID, signedIn: true })
+        ).catch((caught: unknown) => caught)) as Error & { code: string };
+        expect(error.code, `${read} ${item.code}`).toBe(item.expected);
+        expect(error.message, `${read} ${item.code}`).not.toContain("outcome");
+        expect(JSON.stringify({ code: error.code, message: error.message })).not.toMatch(
+          /[0-9a-f]{64}/iu,
+        );
+        expect(error.message).toContain("(HTTP 500)");
       }
   });
 

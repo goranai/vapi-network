@@ -263,41 +263,68 @@ function isVoteContext(source: Record<string, unknown>) {
   );
 }
 
+/** A string that quotes a ballot key: a JSON `"salt"`/`"toWorker"`/`"outcome"` key or `salt=`. */
+const BALLOT_STRING = /"(?:salt|toWorker|outcome)"\s*:|"salt"|\b(?:salt|toWorker)\s*[=:]/iu;
+/** Keys that, next to an outcome or toWorker, mark an object as a ballot echo. */
+const VOTE_KEYS = new Set(["ballot", "vote", "commitment", "reveal"]);
+/** An object that carries an outcome with a split amount, or either next to a vote key. */
+function isBallotShaped(source: Record<string, unknown>) {
+  const keys = new Set(Object.keys(source).map((key) => key.toLowerCase()));
+  const outcome = keys.has("outcome");
+  const split = keys.has("toworker");
+  return (outcome && split) || ((outcome || split) && [...VOTE_KEYS].some((key) => keys.has(key)));
+}
+export const TASK_V2_REDACTED = "[redacted]";
+
 /**
  * A hosted read (plain `show` and `status`) with every unrevealed ballot removed, at any depth:
- * every `salt` key; inside a commit or reveal vote step, operation or request, its calldata
- * (`data`) and its ballot fields (outcome, toWorker, salt, vote, ballot); and any reveal
- * calldata string. Everything else, including reveal outcomes in public chain state, is kept.
+ * - every `salt` key;
+ * - inside a commit or reveal vote step, operation or request, its calldata (`data`) and its
+ *   ballot fields (outcome, toWorker, salt, vote, ballot), and any reveal calldata string;
+ * - outside the chain's `v2State`, any string that quotes a ballot key (it becomes
+ *   `[redacted]`), and the outcome and toWorker of a ballot-shaped object.
+ * Revealed votes in `v2State` are public chain data and are kept; so is everything else,
+ * including ordinary 32-byte values such as transaction hashes.
  */
 export function redactTaskV2Ballots<T>(value: T): T {
-  const walk = (item: unknown, vote: boolean): unknown => {
-    if (typeof item === "string") return isRevealCalldata(item) ? TASK_V2_REDACTED_CALLDATA : item;
-    if (Array.isArray(item)) return item.map((entry: unknown) => walk(entry, vote));
+  const walk = (item: unknown, vote: boolean, chain: boolean): unknown => {
+    if (typeof item === "string") {
+      if (isRevealCalldata(item)) return TASK_V2_REDACTED_CALLDATA;
+      return !chain && BALLOT_STRING.test(item) ? TASK_V2_REDACTED : item;
+    }
+    if (Array.isArray(item)) return item.map((entry: unknown) => walk(entry, vote, chain));
     const source = plainRecord(item);
     if (!source) return item;
     const inside = vote || isVoteContext(source);
+    const ballot = !chain && isBallotShaped(source);
     const out: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(source)) {
       if (/^salt$/iu.test(key) || (inside && BALLOT_FIELDS.has(key))) continue;
+      if (ballot && /^(?:outcome|toWorker)$/iu.test(key)) continue;
       out[key] =
         inside && key === "data" && typeof entry === "string"
           ? TASK_V2_REDACTED_CALLDATA
-          : walk(entry, inside);
+          : walk(entry, inside, chain || key === "v2State");
     }
     return out;
   };
-  return walk(value, false) as T;
+  return walk(value, false, false) as T;
 }
 
-/** A 32-byte hex value (a salt-like value) or a named vote field in an error message. */
-const ECHOED_VOTE = /(?:0x)?[0-9a-f]{64}|\bsalt\b|toWorker|(?:reveal|commit)[-_ ]?vote/iu;
-const SAFE_SERVER_CODE = /^[a-z0-9_.-]{1,64}$/iu;
+/** A 32-byte hex run or any ballot word in an error message. */
+const ECHOED_VOTE = /[0-9a-f]{64}|outcome|toWorker|ballot|salt|vote/iu;
+/** A server error code that cannot carry a ballot: short snake case without a 32-byte run. */
+const safeServerCode = (code: string | undefined) =>
+  code !== undefined && /^[a-z][a-z0-9_]{0,63}$/u.test(code) && !/[0-9a-f]{64}/iu.test(code)
+    ? code
+    : undefined;
 
 /**
  * One hosted call of a plain `show` or `status` read. A hosted error, or a transport error
- * quoting the response, may echo a prepared vote: a message that carries a salt-like value or
- * a vote field is replaced by a fixed message with only the HTTP status, before the usual
- * error mapping (sign-in, not found, unavailable route) runs on its status and code.
+ * quoting the response, may echo a prepared vote: a message with a 32-byte hex run or a ballot
+ * word (outcome, toWorker, ballot, salt, vote) is replaced by a fixed message with only the
+ * HTTP status, and a server code that is not short snake case is dropped (the caller then uses
+ * the fixed `http_<status>` code), before the usual error mapping runs on status and code.
  */
 export async function taskReadWithoutBallots<T>(verb: string, call: () => Promise<T>): Promise<T> {
   try {
@@ -308,8 +335,7 @@ export async function taskReadWithoutBallots<T>(verb: string, call: () => Promis
         status ? ` (HTTP ${status})` : ""
       }; its message was withheld because it may echo a vote. Retry the same command.`;
     if (error instanceof TasksClientError) {
-      const serverCode =
-        error.serverCode && SAFE_SERVER_CODE.test(error.serverCode) ? error.serverCode : undefined;
+      const serverCode = safeServerCode(error.serverCode);
       if (ECHOED_VOTE.test(error.message) || serverCode !== error.serverCode)
         throw new TasksClientError(
           error.code,
@@ -325,9 +351,10 @@ export async function taskReadWithoutBallots<T>(verb: string, call: () => Promis
       throw error;
     }
     if (error instanceof TaskOperationError) {
-      if (ECHOED_VOTE.test(error.message) || error.details)
+      const code = safeServerCode(error.code) ?? "hosted_error";
+      if (ECHOED_VOTE.test(error.message) || error.details || code !== error.code)
         throw new TaskOperationError(
-          error.code,
+          code,
           ECHOED_VOTE.test(error.message) ? withheld() : error.message,
           error.manifestHash,
           error.details && redactTaskV2Ballots(error.details),
