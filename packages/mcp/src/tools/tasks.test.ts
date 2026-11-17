@@ -2584,6 +2584,7 @@ describe("V2 jury and reviewer tools", () => {
     vi.stubEnv("VAPI_TASKS_V2_USDC_84532", RESOLVER);
     vi.stubEnv("VAPI_TASKS_V2_USDC_NAME_84532", "USD Coin");
     vi.stubEnv("VAPI_TASKS_V2_USDC_VERSION_84532", "2");
+    vi.stubEnv("VAPI_TASKS_V2_DISPUTE_RESOLVER_V3_84532", RESOLVER);
     const notice = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const result = await server.callTool({
