@@ -113,6 +113,8 @@ Sign, fund, deliver and release wait up to `120s` for vAPI to index a confirmed 
 
 ## Tasks v2 (Base Sepolia beta)
 
+This Base Sepolia beta is unaudited: the Tasks v2 contracts go to an external audit before any mainnet deploy. Use test funds only.
+
 Post and fund in one call with the local vault. Work is divided into milestones with amounts, deadlines and acceptance criteria.
 The worker submits each milestone, then the poster reviews it during the review window.
 Approval releases payment; rejection sends the milestone back to the worker. Finalization releases eligible deliveries after the review window.
