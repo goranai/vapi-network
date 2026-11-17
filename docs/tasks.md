@@ -456,18 +456,32 @@ funding.
 `claim-owed` must call `claimOwed` on the verified clone with `--to`, or the acting wallet when
 `--to` is absent.
 
-Vote salts stay with the agent. `vote --commit` generates a 32-byte salt locally and asks the
-resolver's own `voteCommitment` view for the commitment over RPC. It writes the ballot to
+Vote salts stay with the agent. `vote --commit` generates a 32-byte salt locally and computes the
+commitment on this machine, exactly as DisputeResolverV3 does:
+`keccak256(abi.encode(escrow, i, round, reviewer, outcome, toWorker, salt))`. Only the public
+dispute round (`disputeRound`) and case id are read over RPC, and the case id must match that round.
+It writes the ballot to
 `VAPI_HOME/tasks/ballots/<chainId>/<resolver>/<caseId>/<commitment>.json` with mode 0600 and an
 fsync before it requests the commit plan. Only the commitment goes to vAPI. A retry with the same
 vote reuses its sealed ballot. `vote --reveal` reads this wallet's onchain `commitments(caseId,
 voter)` and opens only the ballot with that commitment, so a replaced ballot whose commit never mined
 is never revealed. Reveal from the machine that committed; without the ballot there is nothing to
 reveal. Outcomes are `worker`, `poster` and `split` (DisputeResolverV3 order 0, 1, 2). `--to-worker`
-is USDC base units and only for `split`. The vote and its salt leave the machine only in the signed
-reveal transaction: results, progress and errors carry the commitment, case and ballot path, the
-reveal calldata is shown as `[redacted: reveal calldata]`, and an RPC error from `voteCommitment`
-(which quotes its arguments) becomes `commitment_unavailable`. A hosted error on a commit or reveal
+is USDC base units and only for `split`.
+
+Trust boundaries for a ballot:
+
+- Until reveal, the vote and its salt stay on this machine. The commit sends only the commitment to
+  vAPI and to the chain, and neither the RPC nor vAPI sees the vote or the salt.
+- At reveal, the vote and its salt go to the hosted vAPI API, which prepares the reveal transaction,
+  and then to the chain through your RPC in the signed transaction. After the reveal is mined the
+  vote is public chain data.
+
+Results, progress and errors carry the commitment, case and ballot path, and reveal calldata is
+shown as `[redacted: reveal calldata]`. Plain `show` and `status` drop every `salt` field, and the
+calldata and ballot fields of any commit or reveal vote step, at any depth. Revealed votes in chain
+state stay. A `show` or `status` error whose message quotes a salt-like value or a vote field gets a
+fixed message with only the HTTP status. A hosted error on a commit or reveal
 step is never copied, because it may echo the request: it becomes `v2_vote_rejected` with a fixed
 message. Results, errors and `status --operation` recovery or abandon output carry only documented
 fields, down to each lifecycle milestone and the next action; unknown hosted fields are dropped and
