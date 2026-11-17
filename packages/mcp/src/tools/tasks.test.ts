@@ -2441,6 +2441,7 @@ describe("V2 jury and reviewer tools", () => {
       caseState: vi.fn(async () => ({ state: 3, name: "JuryDrawPending", resolver: RESOLVER })),
       sealBallot: vi.fn(async () => ({ ballot, reused: false, path: "/home/ballot.json" })),
       openBallot: vi.fn(async () => ({ ballot, path: "/home/ballot.json" })),
+      assertSealedCase: vi.fn(async () => {}),
     };
     return {
       executeV2,

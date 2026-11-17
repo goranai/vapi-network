@@ -479,9 +479,14 @@ Trust boundaries for a ballot:
 
 Results, progress and errors carry the commitment, case and ballot path, and reveal calldata is
 shown as `[redacted: reveal calldata]`. Plain `show` and `status` drop every `salt` field, and the
-calldata and ballot fields of any commit or reveal vote step, at any depth. Revealed votes in chain
-state stay. A `show` or `status` error whose message quotes a salt-like value or a vote field gets a
-fixed message with only the HTTP status. A hosted error on a commit or reveal
+calldata and ballot fields of any commit or reveal vote step, at any depth. Outside the chain's
+`v2State` they also replace any text that quotes a ballot key with `[redacted]`, and drop
+`outcome` and `toWorker` from an object that carries both, or either one next to `ballot`, `vote`,
+`commitment` or `reveal`. Revealed votes in `v2State` stay. A `show` or `status` error whose message
+has a 32-byte hex value or mentions an outcome, toWorker, ballot, salt or vote gets a fixed message
+with only the HTTP status; a server code that is not short snake case becomes `http_<status>`. If
+the dispute moves to a new round between sealing and signing, the commit stops with
+`v2_round_changed` and nothing is signed; vote again in the new round. A hosted error on a commit or reveal
 step is never copied, because it may echo the request: it becomes `v2_vote_rejected` with a fixed
 message. Results, errors and `status --operation` recovery or abandon output carry only documented
 fields, down to each lifecycle milestone and the next action; unknown hosted fields are dropped and

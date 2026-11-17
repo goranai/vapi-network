@@ -3715,6 +3715,7 @@ describe("Tasks V2 jury and reviewer verbs", () => {
         .mockResolvedValue({ state: 3, name: "JuryDrawPending", resolver: ADDRESS }),
       sealBallot: vi.fn(async () => ({ ballot, reused: false, path: "/home/ballot.json" })),
       openBallot: vi.fn(async () => ({ ballot, path: "/home/ballot.json" })),
+      assertSealedCase: vi.fn(async () => {}),
     };
     return {
       executeV2,

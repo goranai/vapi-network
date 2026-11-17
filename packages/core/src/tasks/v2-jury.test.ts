@@ -738,6 +738,30 @@ describe("V2 vote commit and reveal", () => {
     );
   });
 
+  it("never signs a sealed commitment after the dispute moved to a new round", async () => {
+    const f = await fixture();
+    f.client.prepareV2.mockImplementationOnce(async (_id, write) => {
+      f.writes.push(write);
+      // A tie restored the case and a new round opened while the commit was being prepared.
+      f.chain.round = ROUND + 1;
+      return operation(hostedPlan(write));
+    });
+    const signed = vi.spyOn(account, "signTransaction");
+    const error = await runTaskV2Vote(f.context, {
+      ...f.base,
+      i: 0,
+      action: "commit",
+      outcome: "worker",
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "v2_round_changed",
+      message: expect.stringContaining("vote --commit again"),
+    });
+    expect(signed).not.toHaveBeenCalled();
+    expect(f.rpc.sendRawTransaction).not.toHaveBeenCalled();
+    expect(f.client.prepareV2).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses to seal a ballot when the case id does not match the dispute round", async () => {
     const f = await fixture();
     const original = f.rpc.readContract.getMockImplementation()!;

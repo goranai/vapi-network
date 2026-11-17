@@ -259,6 +259,7 @@ function lazyTasksChain(
       assertJuryOpenable: async (input) => (await juryV2()).assertJuryOpenable(input),
       sealBallot: async (input) => (await juryV2()).sealBallot(input),
       openBallot: async (input) => (await juryV2()).openBallot(input),
+      assertSealedCase: async (input) => (await juryV2()).assertSealedCase(input),
     },
     ...(signingAddress === undefined ? {} : { signingAddress }),
     getSigningAddress: async () => {

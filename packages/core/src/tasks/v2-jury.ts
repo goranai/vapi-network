@@ -294,6 +294,18 @@ export function createTaskV2Jury(options: TasksChainOptions) {
       const path = await writeTaskV2Ballot(home(), ballot);
       return { ballot, reused: false, path };
     },
+    /**
+     * The sealed ballot's case must still be the resolver's current case: a commitment binds its
+     * round, so one signed after the dispute moved on would be accepted but could never reveal.
+     */
+    async assertSealedCase(input: { id: string; i: number; caseId: Hex }) {
+      const { caseId } = await voteCase(input.id, input.i);
+      if (caseId !== input.caseId.toLowerCase())
+        throw new TaskOperationError(
+          "v2_round_changed",
+          "The dispute moved to a new round after this vote was sealed; nothing was signed. Run vote --commit again to vote in the new round.",
+        );
+    },
     /** The ballot whose commitment is onchain for this wallet in the current round. */
     async openBallot(input: { id: string; i: number }) {
       const { target, resolver, caseId, round } = await voteCase(input.id, input.i);
@@ -345,7 +357,10 @@ export function createTaskV2Jury(options: TasksChainOptions) {
 }
 export type TaskV2Jury = ReturnType<typeof createTaskV2Jury>;
 
-type RunBase = Omit<TaskV2ExecutionInput, "write" | "consent" | "prepared" | "preparationKey">;
+type RunBase = Omit<
+  TaskV2ExecutionInput,
+  "write" | "consent" | "prepared" | "preparationKey" | "beforeSigning"
+>;
 function jury(context: TaskOperationContext): TaskV2Jury {
   if (!context.chain.juryV2)
     throw new TaskOperationError("chain_unavailable", "Local jury signing is unavailable.");
@@ -412,6 +427,7 @@ const LOCAL_VOTE_ERROR_CODES = new Set([
   "reveal_unavailable",
   "reveal_window_closed",
   "transaction_reverted",
+  "v2_round_changed",
   "v2_plan_mismatch",
   "v2_resolver_unavailable",
   "v2_trust_unavailable",
@@ -523,6 +539,8 @@ export async function runTaskV2Vote(
     const result = await executeTaskV2(context, {
       ...base,
       write: { action: "commit-vote", i: vote.i, commitment: sealed.ballot.commitment },
+      beforeSigning: () =>
+        jury(context).assertSealedCase({ id: input.id, i: vote.i, caseId: sealed.ballot.caseId }),
     }).catch((error: unknown) => sealedVoteError(error, sealed.ballot));
     return publicVoteResult(
       result,

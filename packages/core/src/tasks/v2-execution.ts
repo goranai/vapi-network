@@ -69,6 +69,11 @@ export type TaskV2ExecutionInput = {
   ledgerPath: string;
   approval?: TaskFundingApproval;
   onMoney?: (money: TaskMoney & { escrow: string }) => void | Promise<void>;
+  /**
+   * Runs right before each transaction is signed or a saved one is reused; a throw stops the
+   * step with nothing signed. A vote commit uses it to recheck its sealed dispute round.
+   */
+  beforeSigning?: () => Promise<void>;
 };
 const uint = z.string().regex(/^\d+$/u);
 const stateSchema = z.object({
@@ -510,6 +515,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
             }
             const rpc = rpcFor(plan.chainId);
             if ((await rpc.getChainId()) !== plan.chainId) fail("Transaction chain mismatch.");
+            await input.beforeSigning?.();
             await beforeSign();
             const saved = await pending.withStepLock(op.id, op.step, () =>
               pending.withSignerLock(plan.chainId, account.address, async () => {
