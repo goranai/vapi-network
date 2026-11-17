@@ -3,6 +3,80 @@
 All notable changes to the published `vapi-network` distribution and its four
 scoped packages. The packages share one version and are released together.
 
+## Unreleased
+
+## 0.13.0 — 2026-11-10
+
+### Added
+
+- `vapi setup` works on Linux without a keyring (servers, containers, GitHub Codespaces): set `VAPI_VAULT_PASSWORD` (at least 12 characters) and the device key and agent link are kept in `~/.vapi/secrets.json`, encrypted with that password. The choice is pinned once per vault in `~/.vapi/secret-store.json`; existing vaults, macOS and Windows keep the OS store.
+
+### Changed
+
+- The Linux device-key failure hint now names `VAPI_VAULT_PASSWORD`.
+
+## 0.12.1 — 2026-11-09
+
+### Fixed
+
+- CLI messages that ask for an API key now link to Connect → API keys (`/connect?advanced=keys#api-keys`). Create a key there; earlier versions linked to `/account`, which has no page.
+- When `vapi setup` cannot store the device vault key, it now says why, for example that `secret-tool` is not installed. On Linux it adds that a server, container or GitHub Codespace usually has no keyring. Run vapi on your own computer or connect Claude from https://api.vapinetwork.ai/connect.
+- OS secret-store errors no longer repeat the keyring tool's raw output, which could contain a secret. They name a known reason (such as no keyring daemon, a locked collection, or no D-Bus) or only the exit code.
+
+## 0.12.0 — 2026-10-30
+
+### Added
+
+- `vapi code install` configures detected Claude Code and Codex tools for vAPI Compute, with optional shell aliases. `vapi code uninstall` removes those settings while preserving other config content.
+- `vapi claude` and `vapi codex` choose vAPI Compute or the tool's own login at launch, with explicit route, balance, model and account options. Sessions stay on the selected route until exit.
+- Core and MCP building blocks for vAPI Desktop: `createVault()` without a first account, per-wallet `linkStates()`, a remote payment account that signs through a caller-supplied channel, and `VapiMcpServer.connect` with caller-supplied streams.
+
+### Fixed
+
+- Windows: secrets now reach Windows Data Protection. Every secret-store call used to exit without doing anything, so the device key was never saved and `vapi setup` failed with "Unable to decrypt the vault with this device key." A vault created this way cannot be opened: move `%USERPROFILE%\.vapi` aside and run `vapi setup` again, choosing `restore` if the account was funded.
+
+### Notes
+
+- Claude Code on vAPI Compute needs the Router's `/v1/messages` fix and prompt-cache pricing, live on vAPI production since v3.26.0.
+
+## 0.11.0 — 2026-10-29
+
+### Added
+
+- The public `vapi-network` package ships `SKILL.md` with setup, discovery, payment and recovery guidance for agents.
+
+- API search results can include registry health and cheaper or healthier alternatives, and inspected endpoints can include response schemas and example requests.
+- CLI JSON and MCP results for search, inspect and pay include up to four hints naming next actions.
+- `vapi search --include-outage` and MCP `call.search`'s `includeOutage` input request listings hidden by the hosted registry's default outage filter.
+- API payment spend-cap refusals now use the typed `spend_cap_exceeded` error with attempted and limit amounts, a non-retryable MCP result, and command guidance when the limit can be raised.
+- `vapi mcp install claude-code` registers the vAPI server through Claude Code's CLI, while `claude-desktop`, `cursor` and `codex` retain file-based setup.
+- Partner listings can display the `failed_calls_free` badge ("Provider failures aren't charged") for APIs served through vAPI's hosted shim.
+
+### Changed
+
+- vAPI Call takes no fee. Providers are paid directly. Publishing now guides providers to set every endpoint's x402 `payTo` to the signed payout wallet before activation, without a splitter lookup or deployment step.
+- Search and inspect show `No network fee` for zero basis points and the registry's label plus the computed percentage for legacy fees. The fee schemas continue to accept legacy 500-basis-point listings.
+- Human search output shows health and alternatives, and inspect shows health and an example request when supplied by the registry.
+- `vapi mcp install claude` remains an alias for Claude Desktop and prints a note naming the separate Claude Code target.
+- Discovery pages accept any `rankingVersion` label, so a registry that re-ranks no longer breaks installed clients. Required before the registry ships `marketplace-ranking-v2`.
+- The hidden-outage hint appears only when the registry reports `totals.hiddenOutage` above zero.
+
+## 0.10.0 — 2026-10-28
+
+### Added
+
+- Every MCP tool has a title and annotations for read-only behavior, destructive actions, idempotency and open-world access.
+- The MCP server identifies itself as vAPI Network with a title, website URL and light/dark icons. `server.json` lists the same icons for the MCP Registry.
+- `call.search` and `call.inspect` support interactive MCP Apps results in Claude Desktop. Views load from the hosted asset route and fall back to text when offline.
+
+## 0.9.7 (2026-10-26)
+
+### Fixed
+
+- `vapi publish <url>` lists a URL that is itself one payable endpoint. The registry answers such a URL in `endpoint` with no `operations`, which publish used to report as "no callable endpoint".
+- `vapi publish` sends each endpoint's `metadataEvidence` from the probe back with the listing, so an endpoint with a request schema is no longer refused with HTTP 422.
+- `--mode` is a hint: the registry accepts it and detects the kind of URL itself. Registries before 2026-10-26 refused it with HTTP 400 "Unrecognized key: mode".
+
 ## 0.9.6 (2026-10-23)
 
 ### Fixed

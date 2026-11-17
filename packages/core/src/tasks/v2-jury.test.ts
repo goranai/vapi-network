@@ -71,6 +71,7 @@ const DEADLINE = "2026-10-28T12:00:00.000Z";
 const NOW_SECONDS = BigInt(Date.parse("2026-10-26T12:00:00Z") / 1000);
 const PIN = {
   escrowFactoryV2: FACTORY,
+  disputeResolverV3: RESOLVER,
   bountyPoolFactoryV1: POOL_FACTORY,
   usdc: USDC,
   usdcName: "USD Coin",

@@ -2,7 +2,10 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { delimiter, isAbsolute, join, win32 } from "node:path";
 
+import { getVapiPaths } from "./config.js";
+import { fileSecretStore } from "./file-secret-store.js";
 import { KeystoreError } from "./keystore.js";
+import { readSecretBackend, secretsFilePath } from "./secret-backend.js";
 
 /**
  * The OS secret store, so an agent never needs a passphrase in plain text.
@@ -88,6 +91,8 @@ export type SecretStore = {
 };
 
 export type SecretStoreOptions = {
+  /** The vAPI home whose secret-store pin decides the backend. Defaults to getVapiPaths().directory. */
+  home?: string | undefined;
   /** Defaults to `process.platform`. */
   platform?: NodeJS.Platform | undefined;
   /** Defaults to running the real binary. */
@@ -98,10 +103,20 @@ export type SecretStoreOptions = {
   installed?: ((file: string) => boolean) | undefined;
 };
 
-/** The secret store of this machine, or one that refuses on every call. */
+/** The secret store pinned for this vault, or the OS store when no pin exists. */
 export function secretStore(options: SecretStoreOptions = {}): SecretStore {
+  const home = options.home ?? getVapiPaths().directory;
+  if (readSecretBackend(home) === "file") {
+    return fileSecretStore({ path: secretsFilePath(home), env: options.env ?? process.env });
+  }
+  return osSecretStore(options);
+}
+
+/** The OS store of this machine, ignoring any pin; setup probes this one. */
+export function osSecretStore(options: SecretStoreOptions = {}): SecretStore {
   const platform = options.platform ?? process.platform;
-  const run = options.run ?? spawnRunner;
+  const run: SecretStoreRunner =
+    options.run ?? (async (file, args, input) => await spawnRunner(platform, file, args, input));
   const env = options.env ?? process.env;
   const installed = options.installed ?? ((file: string) => binaryInstalled(file, env));
   if (platform === "darwin") return keychainStore(platform, run);
@@ -337,7 +352,9 @@ function windowsDataProtectionStore(
     ].join("\n");
 
   const execute = async (script: string): Promise<SecretStoreOutcome> => {
-    const result = await run(powershell, WINDOWS_POWERSHELL_ARGS, `${script}\n`);
+    // PowerShell reads stdin like a prompt: a multi-line block only runs once a
+    // blank line closes it. Without one it exits 0 and has done nothing.
+    const result = await run(powershell, WINDOWS_POWERSHELL_ARGS, `${script}\n\n`);
     requirePowerShell(result);
     return result;
   };
@@ -522,13 +539,24 @@ function binaryInstalled(file: string, env: NodeJS.ProcessEnv): boolean {
   return (env.PATH ?? "").split(delimiter).some((directory) => existsSync(join(directory, file)));
 }
 
+// Subprocess output can contain secrets. Emit only these fixed reasons, never
+// raw stderr or stdout, even when a known reason appears beside a secret.
+const SAFE_FAILURE_DETAILS = [
+  "Cannot autolaunch D-Bus without X11 $DISPLAY",
+  "Cannot autolaunch D-Bus",
+  "The name org.freedesktop.secrets was not provided by any .service files",
+  "Cannot create an item in a locked collection",
+  "User interaction is not allowed.",
+  "Access to the path is denied.",
+] as const;
+
 /** Turns a failed run into one sentence. The passphrase is never in it. */
 function requireSuccess(result: SecretStoreOutcome, what: string): void {
   if (result.code === 0) return;
-  const detail = result.stderr.trim() || result.stdout.trim();
+  const detail = SAFE_FAILURE_DETAILS.find((reason) => result.stderr.includes(reason));
   throw new KeystoreError(
     `Could not ${what}${result.code === null ? "" : ` (exit ${result.code})`}.${
-      detail.length === 0 ? "" : ` ${detail}`
+      detail === undefined ? "" : ` ${detail}`
     }`,
   );
 }
@@ -546,8 +574,16 @@ function withoutTrailingNewline(value: string): string {
  * flag an interactive `vapi unlock` or `vapi login` would stop at the keychain
  * tool's own "password data for new item" prompt and store whatever the user
  * typed there instead of the value the client wrote to the pipe.
+ *
+ * Windows has no controlling terminal to escape, and there the flag starts the
+ * child with no console: PowerShell then exits 0 without running its script.
  */
-const spawnRunner: SecretStoreRunner = async (file, args, input) =>
+const spawnRunner = async (
+  platform: NodeJS.Platform,
+  file: string,
+  args: readonly string[],
+  input?: string,
+): Promise<SecretStoreOutcome> =>
   await new Promise<SecretStoreOutcome>((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -558,7 +594,7 @@ const spawnRunner: SecretStoreRunner = async (file, args, input) =>
       resolve(outcome);
     };
     const child = spawn(file, [...args], {
-      detached: true,
+      detached: platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });

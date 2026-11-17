@@ -54,6 +54,7 @@ const DEADLINE = "2026-10-28T12:00:00.000Z";
 const SALT = keccak256(toHex(V2_WRITE_ORDER));
 const PIN = {
   escrowFactoryV2: FACTORY,
+  disputeResolverV3: RESOLVER,
   bountyPoolFactoryV1: POOL_FACTORY,
   usdc: USDC,
   usdcName: "USD Coin",

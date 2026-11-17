@@ -3816,7 +3816,7 @@ describe("Tasks V2 jury and reviewer verbs", () => {
       VAPI_TASKS_V2_USDC_8453: ADDRESS,
       VAPI_TASKS_V2_USDC_NAME_8453: "USD Coin",
       VAPI_TASKS_V2_USDC_VERSION_8453: "2",
-      VAPI_TASKS_V2_DISPUTE_RESOLVER_8453: ESCROW,
+      VAPI_TASKS_V2_DISPUTE_RESOLVER_V3_8453: ESCROW,
     };
     const values: Record<string, unknown> = {
       implementation: ADDRESS,

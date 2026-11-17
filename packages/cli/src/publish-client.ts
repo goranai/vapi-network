@@ -19,7 +19,7 @@ import type { Address } from "viem";
 export const LISTING_CATEGORIES = ["ai", "data", "crypto", "compute", "search"] as const;
 export type ListingCategory = (typeof LISTING_CATEGORIES)[number];
 
-/** How the registry should read the URL it was handed. Left out, it decides. */
+/** A hint for how to read the URL. The registry detects the kind itself either way. */
 export const PROBE_MODES = ["origin", "endpoint", "openapi"] as const;
 export type ProbeMode = (typeof PROBE_MODES)[number];
 
@@ -38,8 +38,13 @@ export const PAYOUT_STATEMENT = "Confirm this wallet receives vAPI Call payouts"
 /** The sentence a claim message states, completed with the origin being claimed. */
 export const CLAIM_STATEMENT_PREFIX = "Claim the vAPI Call listings served from";
 
-/** Where a person creates the key this client authenticates with. */
-export const API_KEY_CONSOLE_PATH = "/account";
+/** Where a person creates an API key: the Advanced section of the console's Connect page. */
+export function apiKeyConsoleUrl(baseUrl: string): URL {
+  const url = listingsUrl(baseUrl, "/connect");
+  url.search = "advanced=keys";
+  url.hash = "api-keys";
+  return url;
+}
 
 /** One candidate endpoint the probe found behind the URL it was given. */
 export type ProbeOperation = Readonly<{
@@ -67,6 +72,8 @@ export type ProbeRejection = Readonly<{
 /** The console's `VendorProbeResult`, read tolerantly. */
 export type ProbeResult = Readonly<{
   operations?: readonly ProbeOperation[];
+  /** A URL that is itself one payable endpoint answers here, with `operations` empty. */
+  endpoint?: ProbeOperation;
   accepts?: readonly unknown[];
   diagnostics?: Readonly<{
     steps?: readonly unknown[];
@@ -76,23 +83,6 @@ export type ProbeResult = Readonly<{
   Readonly<Record<string, unknown>>;
 
 export type PayoutNonce = Readonly<{ nonce: string; message?: string }> &
-  Readonly<Record<string, unknown>>;
-
-export type SplitterNetworkState = Readonly<{
-  network?: string;
-  name?: string;
-  chainId?: number;
-  factoryAddress?: string;
-  splitterAddress?: string;
-  deployed?: boolean;
-  balanceWei?: string;
-}> &
-  Readonly<Record<string, unknown>>;
-
-export type SplitterStates = Readonly<{
-  networkStates?: readonly SplitterNetworkState[];
-  feeBp?: number;
-}> &
   Readonly<Record<string, unknown>>;
 
 export type ListingEndpointInput = {
@@ -106,6 +96,8 @@ export type ListingEndpointInput = {
   responseContentType?: string;
   pathTemplate?: string;
   pathParameters?: unknown;
+  /** The probe's signature over the metadata above; publish refuses metadata without it. */
+  metadataEvidence?: string;
 };
 
 export type CreateListingInput = {
@@ -173,7 +165,6 @@ export type ListingsClient = {
   readonly baseUrl: string;
   probe(input: { url: string; method?: string; mode?: ProbeMode }): Promise<ProbeResult>;
   payoutNonce(wallet: string): Promise<PayoutNonce>;
-  splitters(wallet: string): Promise<SplitterStates>;
   create(input: CreateListingInput): Promise<CreatedListing>;
   status(slug: string, action: ListingStatusAction): Promise<ListingStatusResult>;
   mine(): Promise<MyListings>;
@@ -238,12 +229,6 @@ export function createListingsClient(options: ListingsClientOptions): ListingsCl
         method: "GET",
         query: { wallet },
       })) as PayoutNonce;
-    },
-    async splitters(wallet) {
-      return (await call("/api/call/listings/splitters", {
-        method: "GET",
-        query: { wallet },
-      })) as SplitterStates;
     },
     async create(input) {
       return (await call("/api/call/listings", { method: "POST", body: input })) as CreatedListing;
@@ -341,13 +326,19 @@ export function buildPayoutSiweMessage(args: {
   );
 }
 
-/** The operations a probe found, normalized to the fields a listing needs. */
+/**
+ * The operations a probe found, normalized to the fields a listing needs. A URL
+ * that is itself one payable endpoint comes back in `endpoint` rather than in
+ * `operations`, so that one is the operation.
+ */
 export function readProbeOperations(probe: ProbeResult): ProbeOperation[] {
-  const operations = probe.operations;
-  if (!Array.isArray(operations)) return [];
-  return operations.filter((operation): operation is ProbeOperation => {
-    return isRecord(operation) && typeof operation.name === "string" && operation.name.length > 0;
-  });
+  const operations = (Array.isArray(probe.operations) ? probe.operations : []).filter(isOperation);
+  if (operations.length > 0) return operations;
+  return isOperation(probe.endpoint) ? [probe.endpoint] : [];
+}
+
+function isOperation(operation: unknown): operation is ProbeOperation {
+  return isRecord(operation) && typeof operation.name === "string" && operation.name.length > 0;
 }
 
 /** The rejection a probe carries, or undefined when the URL passed. */
@@ -386,7 +377,7 @@ async function registryError(response: Response, baseUrl: string): Promise<Regis
       [
         "The vAPI API key was rejected.",
         detail,
-        `Create a key in the console at ${listingsUrl(baseUrl, API_KEY_CONSOLE_PATH).href} and store it with vapi auth set-key.`,
+        `Create a key in the console at ${apiKeyConsoleUrl(baseUrl).href} and store it with vapi auth set-key.`,
       ]
         .filter(Boolean)
         .join(" "),

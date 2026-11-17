@@ -519,6 +519,13 @@ export function cachedMoneyClient(client: TasksClient, snapshot: MoneySnapshot):
 export function fundingRefusalReason(
   error: unknown,
 ): "policy.perTask" | "policy.perDay" | undefined {
+  // x402 payments wrap the reservation's SpendCapError in a structured
+  // SpendCapExceededError; read the cause first, then the structured cap.
+  if (error instanceof Error && error.name === "SpendCapExceededError") {
+    const fromCause = fundingRefusalReason(error.cause);
+    if (fromCause) return fromCause;
+    return "cap" in error && error.cap === "per_day" ? "policy.perDay" : undefined;
+  }
   if (!(
     error instanceof SpendCapError ||
     (error instanceof Error && error.name === "SpendCapError")

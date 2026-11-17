@@ -82,6 +82,7 @@ export {
   type VapiPaymentAccount,
 } from "./keystore.js";
 export * from "./marketplace-contracts.js";
+export * from "./listing-fee.js";
 export {
   cancelMovement,
   executeMovement,
@@ -106,9 +107,13 @@ export * from "./receipts.js";
 export * from "./run-budget.js";
 export * from "./searches.js";
 export * from "./secret-store.js";
+export * from "./file-secret-store.js";
+export * from "./secret-backend.js";
 export * from "./siblings.js";
+export * from "./link-state.js";
 export * from "./stats.js";
 export * from "./spend-policy.js";
+export * from "./spend-cap-exceeded.js";
 export * from "./swarm-capital.js";
 export * from "./swarm.js";
 export * from "./status.js";
@@ -118,6 +123,7 @@ export * from "./transfer.js";
 export * from "./siwx.js";
 export * from "./svm.js";
 export * from "./vault-key.js";
+export * from "./vault-setup.js";
 export {
   readVaultFileUnlocked,
   VaultError,
@@ -128,6 +134,7 @@ export {
 export * from "./wallet.js";
 export * from "./wallet-store.js";
 export * from "./x402.js";
+export * from "./remote-account.js";
 export * from "./x402-pay.js";
 export {
   ARC_MAINNET_CAIP2,
