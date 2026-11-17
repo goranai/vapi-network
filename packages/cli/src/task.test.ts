@@ -3708,6 +3708,7 @@ describe("Tasks V2 jury and reviewer verbs", () => {
       createdAt: NOW.toISOString(),
     } as const;
     const juryV2 = {
+      assertJuryOpenable: vi.fn(async () => {}),
       caseState: vi
         .fn()
         .mockResolvedValueOnce({ state: 6, name: "Snapshotting", resolver: ADDRESS })
@@ -3818,6 +3819,8 @@ describe("Tasks V2 jury and reviewer verbs", () => {
       VAPI_TASKS_V2_DISPUTE_RESOLVER_8453: ESCROW,
     };
     const values: Record<string, unknown> = {
+      implementation: ADDRESS,
+      DISPUTE_RESOLVER: ESCROW,
       registry: ADDRESS,
       vapiId: ADDRESS,
       stakeGate: ADDRESS,

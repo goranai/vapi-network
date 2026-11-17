@@ -7,7 +7,7 @@
 // new dispute round may be raised. There is no mediation or appeal.
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 
-import { getAddress, parseAbi, toHex, zeroHash, type Address, type Hex } from "viem";
+import { getAddress, parseAbi, toHex, zeroAddress, zeroHash, type Address, type Hex } from "viem";
 import { z } from "zod";
 
 import {
@@ -24,9 +24,14 @@ import {
   TaskOperationError,
   type TaskOperationContext,
 } from "./operation-support.js";
-import { disputeResolverV3Abi, escrowFactoryV2Abi } from "./v2-abi.js";
+import {
+  disputeResolverV3Abi,
+  escrowFactoryV2Abi,
+  escrowV2Abi,
+  TASK_V2_CASE_STATE,
+} from "./v2-abi.js";
 import { executeTaskV2, type TaskV2ExecutionInput } from "./v2-execution.js";
-import { v2Read, verifiedV2Resolver, verifyV2Target } from "./v2-plan-guard.js";
+import { v2Read, verifiedV2Case, verifiedV2Resolver, verifyV2Target } from "./v2-plan-guard.js";
 import { getTrustedTasksV2Deployment, type TasksV2DeploymentOverrides } from "./v2-trust.js";
 import { taskV2IndexSchema, type TaskV2Action } from "./v2-write.js";
 import type { PublicClient } from "viem";
@@ -151,11 +156,26 @@ export function createTaskV2Jury(options: TasksChainOptions) {
   return {
     /** Current DisputeResolverV3 case state for one milestone. */
     async caseState(input: { id: string; i: number }) {
-      const { target, resolver, at } = await voteCase(input.id, input.i);
-      const data = z
-        .object({ state: z.number().int().min(0).max(6) })
-        .parse(await v2Read(target.rpc, resolver, disputeResolverV3Abi, "caseData", at));
-      return { state: data.state, name: TASK_V2_CASE_STATES[data.state]!, resolver };
+      const { target } = await voteCase(input.id, input.i);
+      const { resolver, data } = await verifiedV2Case(target, input.i);
+      const state = z.number().int().min(0).max(6).parse(data.state);
+      return { state, name: TASK_V2_CASE_STATES[state]!, resolver };
+    },
+    /**
+     * The jury may open only once the evidence window has closed (DisputeResolverV3 F2: openJury
+     * after evidenceDeadline). Checked against the resolver's caseData and the chain clock, so an
+     * early open is refused locally. A Snapshotting case continues without the check.
+     */
+    async assertJuryOpenable(input: { id: string; i: number }) {
+      const { target } = await voteCase(input.id, input.i);
+      const { data } = await verifiedV2Case(target, input.i);
+      if (data.state !== TASK_V2_CASE_STATE.Matched) return;
+      const now = (await target.rpc.getBlock()).timestamp;
+      if (now <= data.evidenceDeadline)
+        throw new TaskOperationError(
+          "evidence_window_open",
+          `The evidence window is open until ${new Date(Number(data.evidenceDeadline) * 1000).toISOString()}; open the jury after it closes.`,
+        );
     },
     /**
      * Generate a 32-byte salt locally, compute the commitment over RPC and write the
@@ -227,6 +247,25 @@ export function createTaskV2Jury(options: TasksChainOptions) {
     /** The ballot whose commitment is onchain for this wallet in the current round. */
     async openBallot(input: { id: string; i: number }) {
       const { target, resolver, caseId } = await voteCase(input.id, input.i);
+      // Never hand the salt to the hosted API outside the reveal window: others could still
+      // commit after seeing it. Resolver state and the chain clock decide, as revealVote does.
+      const { data } = await verifiedV2Case(target, input.i);
+      const now = (await target.rpc.getBlock()).timestamp;
+      if (data.state !== TASK_V2_CASE_STATE.Voting)
+        throw new TaskOperationError(
+          "reveal_unavailable",
+          "The dispute is not in its voting stage; nothing was revealed.",
+        );
+      if (now <= data.commitDeadline)
+        throw new TaskOperationError(
+          "reveal_not_open",
+          `The commit window is open until ${new Date(Number(data.commitDeadline) * 1000).toISOString()}; reveal after it closes. Nothing was revealed.`,
+        );
+      if (now > data.revealDeadline)
+        throw new TaskOperationError(
+          "reveal_window_closed",
+          "The reveal window has closed; nothing was revealed.",
+        );
       const onchain = await onchainCommitment(target.rpc, resolver, caseId);
       if (onchain === zeroHash)
         throw new TaskOperationError(
@@ -272,6 +311,7 @@ export async function runTaskV2Jury(
   if (!action) throw new TaskInputError("The jury step must be open, draw, rearm or resolve.");
   const { step, maxRounds, i, ...base } = input;
   const write = { action, i } as TaskV2Action;
+  if (step === "open") await jury(context).assertJuryOpenable({ id: input.id, i });
   let rounds = 0;
   for (;;) {
     rounds += 1;
@@ -396,7 +436,8 @@ export async function runTaskV2Vote(
 
 /**
  * Reviewer readiness from local RPC reads only; there is no hosted order-less route yet.
- * The resolver is the local pin, else the pinned factory's disputeResolver() getter.
+ * The resolver is the pinned factory's task implementation's immutable DISPUTE_RESOLVER()
+ * (EscrowFactoryV2 has no resolver getter); an optional local resolver pin must agree with it.
  */
 export async function readTaskV2ReviewerStatus(input: {
   chainId: number;
@@ -418,19 +459,23 @@ export async function readTaskV2ReviewerStatus(input: {
       "v2_plan_mismatch",
       "The RPC chain differs from the pinned V2 chain.",
     );
-  let resolver = pin.disputeResolverV3;
-  if (!resolver) {
-    try {
-      resolver = address.parse(
-        await v2Read(rpc, pin.escrowFactoryV2, escrowFactoryV2Abi, "disputeResolver"),
-      );
-    } catch {
-      throw new TaskOperationError(
-        "v2_resolver_unavailable",
-        `No dispute resolver is pinned for chain ${input.chainId}. Set VAPI_TASKS_V2_DISPUTE_RESOLVER_${input.chainId}.`,
-      );
-    }
+  let resolver: Address;
+  try {
+    const implementation = address.parse(
+      await v2Read(rpc, pin.escrowFactoryV2, escrowFactoryV2Abi, "implementation"),
+    );
+    resolver = address.parse(await v2Read(rpc, implementation, escrowV2Abi, "DISPUTE_RESOLVER"));
+  } catch {
+    throw new TaskOperationError(
+      "v2_resolver_unavailable",
+      `The pinned escrow factory's implementation().DISPUTE_RESOLVER() could not be read on chain ${input.chainId}.`,
+    );
   }
+  if (resolver === zeroAddress || (pin.disputeResolverV3 && resolver !== pin.disputeResolverV3))
+    throw new TaskOperationError(
+      "v2_plan_mismatch",
+      "The pinned factory's dispute resolver differs from the local resolver pin.",
+    );
   const read = (
     contract: Address,
     abi: Parameters<typeof v2Read>[2],

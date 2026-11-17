@@ -388,6 +388,12 @@ vapi task reviewer-status [--address 0x...]
 | `approve-bond`        | `approve-bond`                                | USDC `approve(escrow clone, bond)`                               | The awarded or intended worker                      |
 | `claim-owed`          | `claim-owed`                                  | `claimOwed(to)` on the escrow clone                              | Any account the escrow owes                         |
 
+`vote --reveal` first reads the resolver's `caseData` and the chain clock: it refuses with
+`reveal_not_open` until the commit deadline has passed, `reveal_window_closed` after the reveal
+deadline and `reveal_unavailable` outside the voting stage, so the salt never reaches vAPI while
+others can still commit. `jury --step open` on a matched case refuses with `evidence_window_open` until
+the case's `evidenceDeadline` has passed.
+
 Every step follows the V2 participant write pattern: the hosted API prepares the plan through
 `POST /v1/work-orders/{id}/writes`, the client verifies it locally, signs with the local vault and
 confirms. Indices are zero-based C0 indices. `jury --step open` repeats while the case is
@@ -421,8 +427,9 @@ reveal transaction: results, progress and errors carry the commitment, case and 
 reveal calldata is shown as `[redacted: reveal calldata]`, and an RPC error from `voteCommitment`
 (which quotes its arguments) becomes `commitment_unavailable`.
 
-`reviewer-status` reads the chain directly. It takes the resolver from the local pin, or the pinned
-escrow factory's `disputeResolver()` getter, then reads the registry seat (`isReviewer`), the vAPI ID
+`reviewer-status` reads the chain directly. It takes the resolver from the pinned escrow factory's
+task implementation (`implementation()` then its immutable `DISPUTE_RESOLVER()`; the factory has no
+resolver getter), which an optional local resolver pin must match, then reads the registry seat (`isReviewer`), the vAPI ID
 (`hasId`), the stake (`stakedBalance` on the gate's `staking()`) against the gate `threshold()`, the
 gate's `isEligible`, and the resolver's `available`, `suspended`, `missedReveals` and `claimable`.
 `ready` is true only when all of these allow a draw.

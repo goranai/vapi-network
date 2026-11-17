@@ -2437,6 +2437,7 @@ describe("V2 jury and reviewer tools", () => {
       createdAt: NOW,
     };
     const juryV2 = {
+      assertJuryOpenable: vi.fn(async () => {}),
       caseState: vi.fn(async () => ({ state: 3, name: "JuryDrawPending", resolver: RESOLVER })),
       sealBallot: vi.fn(async () => ({ ballot, reused: false, path: "/home/ballot.json" })),
       openBallot: vi.fn(async () => ({ ballot, path: "/home/ballot.json" })),
@@ -2550,7 +2551,8 @@ describe("V2 jury and reviewer tools", () => {
 
   it("reads reviewer status for an address from local RPC reads", async () => {
     const values: Record<string, unknown> = {
-      disputeResolver: RESOLVER,
+      implementation: RESOLVER,
+      DISPUTE_RESOLVER: RESOLVER,
       registry: RESOLVER,
       vapiId: RESOLVER,
       stakeGate: RESOLVER,

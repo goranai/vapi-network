@@ -207,7 +207,11 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
   const order = view(options.workerBondBp);
   const chain = {
     commitment: zeroHash as Hex,
-    caseStates: [2] as number[],
+    // Queued caseData states; Voting (4) once the queue is empty.
+    caseStates: [] as number[],
+    evidenceDeadline: NOW_SECONDS - 3600n,
+    commitDeadline: NOW_SECONDS - 60n,
+    revealDeadline: NOW_SECONDS + 3600n,
     resolverOnClone: RESOLVER as string,
     owed: 5_000_000n,
     workerBondBp: undefined as number | undefined,
@@ -287,7 +291,13 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
           case "voteCommitment":
             return fakeCommitment(call.args!);
           case "caseData":
-            return { state: chain.caseStates.shift() ?? 4 };
+            return {
+              state: chain.caseStates.shift() ?? 4,
+              raisedBy: POSTER,
+              evidenceDeadline: chain.evidenceDeadline,
+              commitDeadline: chain.commitDeadline,
+              revealDeadline: chain.revealDeadline,
+            };
           case "owed":
             return chain.owed;
           default:
@@ -742,6 +752,29 @@ describe("V2 vote commit and reveal", () => {
     });
   });
 
+  it.each([
+    ["during the commit window", "reveal_not_open", { commitDeadline: NOW_SECONDS }],
+    ["after the reveal window", "reveal_window_closed", { revealDeadline: NOW_SECONDS - 1n }],
+    ["outside the voting stage", "reveal_unavailable", { caseStates: [5] }],
+  ] as const)(
+    "refuses to reveal %s before the salt leaves the machine",
+    async (_n, code, chain) => {
+      const f = await fixture();
+      const sealed = await createTaskV2Jury(f.options).sealBallot({
+        id: V2_WRITE_ORDER,
+        i: 0,
+        outcome: 1,
+        toWorker: "0",
+      });
+      f.chain.commitment = sealed.ballot.commitment;
+      Object.assign(f.chain, "caseStates" in chain ? { caseStates: [...chain.caseStates] } : chain);
+      await expect(
+        runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" }),
+      ).rejects.toMatchObject({ code });
+      expect(f.client.prepareV2).not.toHaveBeenCalled();
+    },
+  );
+
   it("refuses a second, different commit in the same round", async () => {
     const f = await fixture();
     f.chain.commitment = `0x${"de".repeat(32)}`;
@@ -754,10 +787,21 @@ describe("V2 vote commit and reveal", () => {
 describe("V2 jury, bond and owed steps", () => {
   it("repeats open while the case is Snapshotting", async () => {
     const f = await fixture();
-    f.chain.caseStates = [6, 6, 3];
+    // Matched with a closed evidence window, then two snapshot batches.
+    f.chain.caseStates = [2, 6, 6, 3];
     const result = await runTaskV2Jury(f.context, { ...f.base, i: 0, step: "open" });
     expect(result).toMatchObject({ ok: true, rounds: 3, caseState: "JuryDrawPending" });
     expect(f.writes).toEqual(Array(3).fill({ action: "open-jury", i: 0 }));
+  });
+
+  it("refuses to open the jury while the evidence window is open", async () => {
+    const f = await fixture();
+    f.chain.caseStates = [2];
+    f.chain.evidenceDeadline = NOW_SECONDS;
+    await expect(runTaskV2Jury(f.context, { ...f.base, i: 0, step: "open" })).rejects.toMatchObject(
+      { code: "evidence_window_open" },
+    );
+    expect(f.client.prepareV2).not.toHaveBeenCalled();
   });
 
   it("runs draw without moving USDC", async () => {
@@ -841,7 +885,8 @@ describe("reviewer status from local RPC reads", () => {
         reads.push(`${call.address}:${call.functionName}`);
         return (
           {
-            disputeResolver: RESOLVER,
+            implementation: IMPLEMENTATION,
+            DISPUTE_RESOLVER: RESOLVER,
             registry: OTHER,
             vapiId: POSTER,
             stakeGate: ESCROW,
@@ -879,15 +924,20 @@ describe("reviewer status from local RPC reads", () => {
       missedReveals: 1,
       ready: false,
     });
-    expect(reads).toContain(`${FACTORY}:disputeResolver`);
+    expect(reads.slice(0, 2)).toEqual([
+      `${FACTORY}:implementation`,
+      `${IMPLEMENTATION}:DISPUTE_RESOLVER`,
+    ]);
     expect(reads).toContain(`${STAKING}:stakedBalance`);
   });
 
-  it("prefers a local resolver pin over the factory getter", async () => {
+  it("requires a local resolver pin to agree with the factory implementation's resolver", async () => {
+    const chainResolver = { value: RESOLVER as string };
     const rpc = {
       getChainId: vi.fn(async () => 84532),
       readContract: vi.fn(async (call: { functionName: string }) => {
-        if (call.functionName === "disputeResolver") throw new Error("not on this factory");
+        if (call.functionName === "implementation") return IMPLEMENTATION;
+        if (call.functionName === "DISPUTE_RESOLVER") return chainResolver.value;
         return ["isReviewer", "hasId", "isEligible", "available", "suspended"].includes(
           call.functionName,
         )
@@ -899,24 +949,22 @@ describe("reviewer status from local RPC reads", () => {
               : OTHER;
       }),
     };
-    const status = await readTaskV2ReviewerStatus({
-      chainId: 84532,
-      wallet: account.address,
-      rpcFor: () => rpc as unknown as PublicClient,
-      env: {},
-      trustedV2Deployments: { 84532: { ...PIN, disputeResolverV3: RESOLVER } },
-      onV2UntrustedOverride: () => {},
-    });
-    expect(status.resolver).toBe(RESOLVER);
-    await expect(
+    const read = (pin: Record<string, unknown>) =>
       readTaskV2ReviewerStatus({
         chainId: 84532,
         wallet: account.address,
         rpcFor: () => rpc as unknown as PublicClient,
-        trustedV2Deployments: { 84532: PIN },
+        env: {},
+        trustedV2Deployments: { 84532: { ...PIN, ...pin } },
         onV2UntrustedOverride: () => {},
-      }),
-    ).rejects.toMatchObject({ code: "v2_resolver_unavailable" });
+      });
+    expect((await read({ disputeResolverV3: RESOLVER })).resolver).toBe(RESOLVER);
+    chainResolver.value = OTHER;
+    await expect(read({ disputeResolverV3: RESOLVER })).rejects.toMatchObject({
+      code: "v2_plan_mismatch",
+    });
+    rpc.readContract.mockRejectedValue(new Error("no implementation"));
+    await expect(read({})).rejects.toMatchObject({ code: "v2_resolver_unavailable" });
   });
 });
 
