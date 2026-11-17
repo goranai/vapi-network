@@ -269,7 +269,7 @@ the action. Stable hosted errors such as `v2_writes_disabled`,
 `chain_preflight_unavailable`, `v2_binding_mismatch`,
 `v2_funding_snapshot_unavailable` and `v1_order` retain their codes.
 
-Approval, pool creation and action steps run in sequence. A failed step stops the
+Creation, approval and action steps run in sequence. A failed step stops the
 sequence. Signed transaction bytes and preparation keys persist in the local
 pending journal; retrying the original command resumes its hosted operation.
 The CLI and SDK poll order-level confirm/reconcile and recover responses without
@@ -304,6 +304,13 @@ VAPI_TASKS_V2_USDC_NAME_84532='USD Coin'
 VAPI_TASKS_V2_USDC_VERSION_84532=2
 ```
 
+The guard reads the current contracts: the factory's `paymentToken()`, the clone's
+`FACTORY()`, `USDC()`, `terms()` and `totalPrincipal()`, and consent nonces from
+`consentNonces()` under the `vAPI Tasks Escrow` version `2` EIP-712 domain. Its ABI
+entries are copied from the vapi-app generated artifact by
+`node scripts/sync-tasks-v2-abi.mjs <vapi-app checkout>` (`--check` reports a stale
+copy); never edit `packages/core/src/tasks/v2-abi.generated.ts` by hand.
+
 Cloud inputs use the `VAPI_NETWORK_` prefix. Every override is logged to stderr as
 “untrusted override”; SDK callers can supply `trustedV2Deployments` and
 `onV2UntrustedOverride` in the chain options. Factory membership, poster, token,
@@ -314,9 +321,13 @@ the on-chain role required by the action; award consent comes from the prospecti
 worker before assignment. The money confirmation preview includes the verified
 escrow address.
 
-Fresh approval-first funding predicts the recipient from accepted order terms
-and local defaults before approving the pinned factory. The later creation step
-must use exactly those inputs. An accepted bounty choice window takes precedence
+Fresh funding follows the hosted sequence: `createEscrow` (or `createPool`) on the
+pinned factory, a USDC approval of the new clone, then `fund()` on the clone; with
+an EIP-3009 authorization a task is created and funded in one
+`createAndFundWithAuthorization` call. The client predicts the clone from accepted
+order terms, local defaults, the pinned factory's `feeBp()` and its implementation's
+`MIN_OBJECTION_WINDOW()`; every creation input (the complete `IEscrowV2.Terms`
+tuple, the milestones and the order salt) must match that prediction. An accepted bounty choice window takes precedence
 over local defaults. Unset offer TTL and choice windows default to 604800 seconds;
 staging can explicitly set
 `VAPI_TASKS_V2_OFFER_TTL_SECONDS_<chainId>` and
@@ -330,15 +341,14 @@ undeployed recipient, so that authorization is refused until the recipient can
 be independently verified. Pool funding also requires its on-chain verifier to
 be the accepted poster; an independently trusted delegated checker is not yet
 configured. Funding authorizations require the exact pinned USDC
-domain and schema, a 32-byte nonce and a chain-clock validity window of at most
-one hour.
+domain and schema, a 32-byte nonce, a start before the chain clock and an expiry at
+most one hour after it.
 
 Every transaction selector, destination and requested index/amount is checked
-before signing. C0 task creation funding approves only the pinned escrow factory;
-pool funding and dispute fees approve only the verified clone, for the exact
-amount paid. Unmatched settlement requires a verified disputed milestone,
-resolver state, elapsed evidence window and opener event before its money
-preview. Voluntary refunds include pending and submitted milestones; cancelling
+before signing. Funding, dispute fees and the worker bond approve only the verified
+clone, for the exact amount paid. Unmatched settlement requires a verified disputed
+milestone and the clone resolver's `caseData` (Raised, the same opener, an elapsed
+evidence deadline) before its money preview. Voluntary refunds include pending and submitted milestones; cancelling
 an unpaid remainder includes pending milestones only.
 
 Post-with-funding persists its original unsigned operation or intent and

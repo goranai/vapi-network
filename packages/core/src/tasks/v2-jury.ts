@@ -24,7 +24,7 @@ import {
   TaskOperationError,
   type TaskOperationContext,
 } from "./operation-support.js";
-import { disputeResolverV3JuryAbi, escrowFactoryV2Abi } from "./v2-abi.js";
+import { disputeResolverV3Abi, escrowFactoryV2Abi } from "./v2-abi.js";
 import { executeTaskV2, type TaskV2ExecutionInput } from "./v2-execution.js";
 import { v2Read, verifiedV2Resolver, verifyV2Target } from "./v2-plan-guard.js";
 import { getTrustedTasksV2Deployment, type TasksV2DeploymentOverrides } from "./v2-trust.js";
@@ -101,7 +101,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
     const resolver = await verifiedV2Resolver(target);
     const at = [target.escrow, i] as const;
     const caseId = hash.parse(
-      await v2Read(target.rpc, resolver, disputeResolverV3JuryAbi, "currentCaseId", at),
+      await v2Read(target.rpc, resolver, disputeResolverV3Abi, "currentCaseId", at),
     );
     return { target, resolver, caseId, at };
   }
@@ -111,10 +111,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
     caseId: Hex,
   ): Promise<Hex> {
     return hash.parse(
-      await v2Read(rpc, resolver, disputeResolverV3JuryAbi, "commitments", [
-        caseId,
-        account.address,
-      ]),
+      await v2Read(rpc, resolver, disputeResolverV3Abi, "commitments", [caseId, account.address]),
     );
   }
   /** Never re-implement the hash: the resolver's own voteCommitment view is the preimage rule. */
@@ -124,7 +121,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
     ballot: Pick<TaskV2Ballot, "escrow" | "i" | "outcome" | "toWorker" | "salt">,
   ): Promise<Hex> {
     return hash.parse(
-      await v2Read(rpc, resolver, disputeResolverV3JuryAbi, "voteCommitment", [
+      await v2Read(rpc, resolver, disputeResolverV3Abi, "voteCommitment", [
         getAddress(ballot.escrow),
         ballot.i,
         account.address,
@@ -141,7 +138,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
       const { target, resolver, at } = await voteCase(input.id, input.i);
       const data = z
         .object({ state: z.number().int().min(0).max(6) })
-        .parse(await v2Read(target.rpc, resolver, disputeResolverV3JuryAbi, "caseData", at));
+        .parse(await v2Read(target.rpc, resolver, disputeResolverV3Abi, "caseData", at));
       return { state: data.state, name: TASK_V2_CASE_STATES[data.state]!, resolver };
     },
     /**
@@ -393,9 +390,9 @@ export async function readTaskV2ReviewerStatus(input: {
     name: string,
     args: readonly unknown[] = [],
   ) => v2Read(rpc, contract, abi, name, args);
-  const registry = address.parse(await read(resolver, disputeResolverV3JuryAbi, "registry"));
-  const vapiId = address.parse(await read(resolver, disputeResolverV3JuryAbi, "vapiId"));
-  const stakeGate = address.parse(await read(resolver, disputeResolverV3JuryAbi, "stakeGate"));
+  const registry = address.parse(await read(resolver, disputeResolverV3Abi, "registry"));
+  const vapiId = address.parse(await read(resolver, disputeResolverV3Abi, "vapiId"));
+  const stakeGate = address.parse(await read(resolver, disputeResolverV3Abi, "stakeGate"));
   const staking = address.parse(await read(stakeGate, gateAbi, "staking"));
   const flag = (value: unknown) => z.boolean().parse(value);
   const uint = (value: unknown) => z.bigint().nonnegative().parse(value);
@@ -412,14 +409,10 @@ export async function readTaskV2ReviewerStatus(input: {
     staked: uint(await read(staking, stakingAbi, "stakedBalance", [wallet])).toString(),
     threshold: uint(await read(stakeGate, gateAbi, "threshold")).toString(),
     eligible: flag(await read(stakeGate, gateAbi, "isEligible", [wallet])),
-    available: flag(await read(resolver, disputeResolverV3JuryAbi, "available", [wallet])),
-    suspended: flag(await read(resolver, disputeResolverV3JuryAbi, "suspended", [wallet])),
-    claimable: uint(
-      await read(resolver, disputeResolverV3JuryAbi, "claimable", [wallet]),
-    ).toString(),
-    missedReveals: Number(
-      await read(resolver, disputeResolverV3JuryAbi, "missedReveals", [wallet]),
-    ),
+    available: flag(await read(resolver, disputeResolverV3Abi, "available", [wallet])),
+    suspended: flag(await read(resolver, disputeResolverV3Abi, "suspended", [wallet])),
+    claimable: uint(await read(resolver, disputeResolverV3Abi, "claimable", [wallet])).toString(),
+    missedReveals: Number(await read(resolver, disputeResolverV3Abi, "missedReveals", [wallet])),
   };
   const meetsStake = BigInt(status.staked) >= BigInt(status.threshold);
   return {

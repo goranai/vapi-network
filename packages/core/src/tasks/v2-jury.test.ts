@@ -28,7 +28,7 @@ import type { TasksClient } from "./client.js";
 import type { TaskOperationContext } from "./operation-support.js";
 import { createPendingTransactions } from "./pending-transactions.js";
 import { readSpendLedger } from "../spend-policy.js";
-import { disputeResolverV3JuryAbi, escrowV2OwedAbi } from "./v2-abi.js";
+import { disputeResolverV3Abi, escrowV2Abi } from "./v2-abi.js";
 import { createTaskV2Executor } from "./v2-execution.js";
 import {
   createTaskV2Jury,
@@ -64,6 +64,7 @@ const USDC = getAddress(`0x${"44".repeat(20)}`);
 const FACTORY = getAddress(`0x${"55".repeat(20)}`);
 const POOL_FACTORY = getAddress(`0x${"66".repeat(20)}`);
 const RESOLVER = getAddress(`0x${"99".repeat(20)}`);
+const IMPLEMENTATION = getAddress(`0x${"67".repeat(20)}`);
 const OTHER = getAddress(`0x${"bb".repeat(20)}`);
 const CASE_ID = `0x${"c1".repeat(32)}` as Hex;
 const DEADLINE = "2026-10-28T12:00:00.000Z";
@@ -130,7 +131,7 @@ function hostedPlan(write: TaskV2Action) {
   const resolverCall = (functionName: string, args: readonly unknown[]) => ({
     to: RESOLVER,
     data: encodeFunctionData({
-      abi: disputeResolverV3JuryAbi,
+      abi: disputeResolverV3Abi,
       functionName: functionName as "openJury",
       args: args as never,
     }),
@@ -166,7 +167,7 @@ function hostedPlan(write: TaskV2Action) {
         step: "v2-claim-owed",
         to: ESCROW,
         data: encodeFunctionData({
-          abi: escrowV2OwedAbi,
+          abi: escrowV2Abi,
           functionName: "claimOwed",
           args: [write.to ?? account.address],
         }),
@@ -209,6 +210,7 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
     caseStates: [2] as number[],
     resolverOnClone: RESOLVER as string,
     owed: 5_000_000n,
+    workerBondBp: undefined as number | undefined,
   };
   const rpc = {
     getChainId: vi.fn(async () => 84532),
@@ -227,34 +229,39 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
         switch (call.functionName) {
           case "isEscrow":
             return true;
-          case "usdc":
+          case "paymentToken":
+          case "USDC":
             return USDC;
-          case "poster":
-            return POSTER;
-          case "worker":
-            return options.worker ?? OTHER;
-          case "shape":
-          case "winners":
-            return 0;
-          case "rewardPerWinner":
-            return 0n;
-          case "offerTtl":
+          case "FACTORY":
+            return FACTORY;
+          case "implementation":
+            return IMPLEMENTATION;
+          case "MIN_OBJECTION_WINDOW":
             return 86400n;
-          case "choiceWindow":
-          case "reviewWindow":
-            return 604800n;
-          case "total":
-            return 100000000n;
           case "feeBp":
             return 500;
-          case "termsHash":
-            return acceptedV2TermsHash(
-              order as unknown as import("./types.js").GetOrderResponse,
-              PIN,
-              604800n,
-            );
-          case "termsDigest":
-            return `0x${"12".repeat(32)}`;
+          case "terms":
+            return {
+              shape: 0,
+              poster: POSTER,
+              worker: options.worker ?? OTHER,
+              termsHash: acceptedV2TermsHash(
+                order as unknown as import("./types.js").GetOrderResponse,
+                PIN,
+                604800n,
+              ),
+              offerTtl: 86400n,
+              reviewWindow: 604800n,
+              choiceWindow: 0n,
+              bountyDeadline: 0n,
+              objectionWindow: 604800n,
+              workerBondBp: chain.workerBondBp ?? options.workerBondBp ?? 0,
+              feeBp: 500,
+              winners: 0,
+              rewardPerWinner: 0n,
+            };
+          case "totalPrincipal":
+            return 100000000n;
           case "milestoneCount":
             return 1;
           case "milestone": {
@@ -263,6 +270,7 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
               amount: BigInt(m.amountBaseUnits),
               deadline: BigInt(Date.parse(DEADLINE) / 1000),
               status: statuses.indexOf(m.status),
+              deliveryHash: zeroHash,
             };
           }
           case "predictEscrow":
@@ -395,7 +403,7 @@ describe("V2 jury plan guard", () => {
       step: "v2-open-jury",
       to: RESOLVER,
       data: encodeFunctionData({
-        abi: disputeResolverV3JuryAbi,
+        abi: disputeResolverV3Abi,
         functionName: "continueJury",
         args: [ESCROW, 0],
       }),

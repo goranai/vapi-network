@@ -115,6 +115,7 @@ export const taskV2StepSchema = z.enum([
   "v2-fund",
   "v2-approve-usdc",
   "v2-create-pool",
+  "v2-create-escrow",
   "v2-award",
   "v2-award-bounty",
   "v2-submit",

@@ -1,4 +1,4 @@
-import { escrowV2Abi, bountyPoolV1Abi, escrowV2OwedAbi } from "./v2-abi.js";
+import { bountyPoolV1Abi } from "./v2-abi.js";
 import {
   acceptedV2WorkerBond,
   isV2ResolverAction,
@@ -202,12 +202,11 @@ export function createTaskV2Executor(options: TasksChainOptions) {
         if (action.action === "fund") pays = gross;
       } else if (action.action === "award-bounty") {
         if (!terms?.bounty) fail("Hosted bounty terms are unavailable.");
-        const reward = BigInt(
-          String(await v2Read(target.rpc, target.escrow, escrowV2Abi, "rewardPerWinner")),
-        );
+        const reward = target.terms?.rewardPerWinner;
+        if (reward === undefined) fail("The verified bounty terms are unavailable.");
         if (reward !== BigInt(terms!.bounty!.rewardPerWinnerBaseUnits))
           v2GuardFailure("Hosted bounty reward differs from its verified on-chain amount.");
-        gross = reward * BigInt(action.winners.length);
+        gross = reward! * BigInt(action.winners.length);
       } else if (action.action === "pay-claim") {
         if (!terms?.pool) fail("Hosted pool reward is unavailable.");
         gross = BigInt(
@@ -261,9 +260,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
         feeBp = 0;
       } else if (action.action === "claim-owed") {
         gross = BigInt(
-          String(
-            await v2Read(target.rpc, target.escrow, escrowV2OwedAbi, "owed", [account.address]),
-          ),
+          String(await v2Read(target.rpc, target.escrow, target.abi, "owed", [account.address])),
         );
         if (gross === 0n)
           throw new TaskOperationError(
@@ -397,7 +394,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
           action.action === "approve-bond" ? "v2-approve-usdc" : `v2-${action.action}`;
         const allowedSteps =
           action.action === "fund"
-            ? ["v2-create-pool", "v2-approve-usdc", "v2-fund"]
+            ? ["v2-create-escrow", "v2-create-pool", "v2-approve-usdc", "v2-fund"]
             : action.action === "raise-dispute" || action.action === "counter-evidence"
               ? ["v2-approve-usdc", finalStep]
               : [finalStep];
