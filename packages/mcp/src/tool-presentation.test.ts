@@ -57,6 +57,7 @@ const destructiveTools = [
   "tasks.refund",
   "tasks.dispute",
   "tasks.resolve-unmatched",
+  "tasks.jury",
   "tasks.approve-bond",
   "tasks.claim-owed",
   "tasks.sign",
