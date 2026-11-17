@@ -400,8 +400,11 @@ clone that the pinned factory registered and requires every jury and vote plan t
 address. An optional `VAPI_TASKS_V2_DISPUTE_RESOLVER_<chainId>` pin, read with the other V2 override
 variables, must agree with it. The guard decodes each plan with the DisputeResolverV3 ABI and compares
 the selector, escrow, index, commitment, outcome, `toWorker` and salt to the requested step. A bond
-approval must approve exactly the agreed bond, principal × `workerBondBp` / 10,000, to the verified
-clone; the poster cannot run it, and it counts against the task and daily caps as escrow funding.
+approval must approve exactly the bond `EscrowV2.award` collects, the clone's `totalPrincipal()` × its
+`terms().workerBondBp` / 10,000, to the verified clone. That on-chain rate must equal the accepted
+order terms (it is also part of the frozen terms hash); a rate from the hosted response alone is
+never used. The poster cannot run it, and it counts against the task and daily caps as escrow
+funding.
 `claim-owed` must call `claimOwed` on the verified clone with `--to`, or the acting wallet when
 `--to` is absent.
 

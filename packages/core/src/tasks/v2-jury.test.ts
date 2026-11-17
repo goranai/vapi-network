@@ -211,6 +211,7 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
     resolverOnClone: RESOLVER as string,
     owed: 5_000_000n,
     workerBondBp: undefined as number | undefined,
+    termsHash: undefined as Hex | undefined,
   };
   const rpc = {
     getChainId: vi.fn(async () => 84532),
@@ -245,11 +246,13 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
               shape: 0,
               poster: POSTER,
               worker: options.worker ?? OTHER,
-              termsHash: acceptedV2TermsHash(
-                order as unknown as import("./types.js").GetOrderResponse,
-                PIN,
-                604800n,
-              ),
+              termsHash:
+                chain.termsHash ??
+                acceptedV2TermsHash(
+                  order as unknown as import("./types.js").GetOrderResponse,
+                  PIN,
+                  604800n,
+                ),
               offerTtl: 86400n,
               reviewWindow: 604800n,
               choiceWindow: 0n,
@@ -714,6 +717,43 @@ describe("V2 jury, bond and owed steps", () => {
       "juror" as WalletName,
     );
     expect(JSON.stringify(ledger)).toContain("10000000");
+  });
+
+  it.each([
+    ["a hosted bond rate the frozen terms hash does not carry", "hosted"],
+    ["a clone whose terms().workerBondBp differs from the accepted terms", "clone"],
+  ] as const)("refuses an approve-bond for %s", async (_name, attack) => {
+    const f = await fixture({ worker: zeroAddress, workerBondBp: 1000 });
+    if (attack === "hosted") {
+      // The clone and its frozen terms hash agree on 10%; the hosted view claims 20%.
+      f.chain.termsHash = acceptedV2TermsHash(
+        f.order as unknown as import("./types.js").GetOrderResponse,
+        PIN,
+        604800n,
+      );
+      (f.order.workOrder.terms as { workerBondBp?: number }).workerBondBp = 2000;
+    } else f.chain.workerBondBp = 500;
+    const bond = attack === "hosted" ? 20_000_000n : 5_000_000n;
+    f.client.prepareV2.mockImplementation(async (_id: string, write: TaskV2Action) => {
+      f.writes.push(write);
+      return operation({
+        step: "v2-approve-usdc",
+        to: USDC,
+        data: encodeFunctionData({
+          abi: approvalAbi,
+          functionName: "approve",
+          args: [ESCROW, bond],
+        }),
+      });
+    });
+    const sign = vi.spyOn(account, "signTransaction");
+    const execute = createTaskV2Executor(f.options);
+    await expect(execute({ ...f.base, write: { action: "approve-bond" } })).rejects.toMatchObject({
+      code: "v2_plan_mismatch",
+    });
+    expect(sign).not.toHaveBeenCalled();
+    expect(f.rpc.sendRawTransaction).not.toHaveBeenCalled();
+    await expect(readFile(f.base.ledgerPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("claims owed credit to the caller by default", async () => {

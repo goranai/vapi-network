@@ -168,7 +168,7 @@ export type VerifiedV2Target = {
   creationArgs?: readonly unknown[];
 };
 /** Inputs a fresh clone freezes from the pinned factory, never from the hosted response. */
-type CreationPolicy = { feeBp: number; minObjectionWindow: bigint; workerBondBp?: number };
+type CreationPolicy = { feeBp: number; minObjectionWindow: bigint };
 
 function acceptedV2Total(view: GetOrderResponse): bigint {
   const terms = view.workOrder.terms;
@@ -271,13 +271,10 @@ export function acceptedV2TermsHash(
   });
 }
 
-/** The worker bond the order declares (EscrowV2 accepts it only on a one-milestone task). */
-function declaredWorkerBondBp(view: GetOrderResponse) {
-  return (
-    z
-      .object({ workerBondBp: z.number().int().min(0).max(2000).optional() })
-      .safeParse(view.workOrder.terms).data?.workerBondBp ?? 0
-  );
+/** The worker bond the accepted order declares (EscrowV2 accepts it only on a one-milestone task). */
+function acceptedWorkerBondBp(view: GetOrderResponse) {
+  const terms = z.object(taskTermsFields).parse(view.workOrder.terms);
+  return terms.bounty ? 0 : (terms.workerBondBp ?? 0);
 }
 
 /**
@@ -338,7 +335,7 @@ function acceptedCreationArgs(
         windows.reviewWindow > policy.minObjectionWindow
           ? windows.reviewWindow
           : policy.minObjectionWindow,
-      workerBondBp: policy.workerBondBp ?? (bounty ? 0 : declaredWorkerBondBp(view)),
+      workerBondBp: acceptedWorkerBondBp(view),
       feeBp: policy.feeBp,
       winners: bounty?.winners ?? 0,
       rewardPerWinner: BigInt(bounty?.rewardPerWinnerBaseUnits ?? 0),
@@ -396,6 +393,8 @@ function verifyAcceptedCreation(
     return v2GuardFailure(
       "The registered target or funding calldata differs from accepted order terms.",
     );
+  if (terms.workerBondBp !== accepted.workerBondBp)
+    return v2GuardFailure("The escrow's worker bond differs from the accepted order terms.");
   if (canon(creationArgs) !== canon(expected))
     return v2GuardFailure("Funding milestone or bounty allocations differ from accepted terms.");
 }
@@ -661,11 +660,7 @@ export async function verifyV2Target(
     creationArgs,
     pool,
     chainId,
-    {
-      feeBp,
-      minObjectionWindow: pool ? 0n : await minObjectionWindow(rpc, pin),
-      ...(terms ? { workerBondBp: terms.workerBondBp } : {}),
-    },
+    { feeBp, minObjectionWindow: pool ? 0n : await minObjectionWindow(rpc, pin) },
     action.action === "fund",
   );
   if (suppliedCreation && canon(suppliedCreation) !== canon(creationArgs))
@@ -814,14 +809,19 @@ export async function verifiedV2Resolver(target: VerifiedV2Target) {
   return resolver;
 }
 
-/** The agreed worker bond: on-chain principal × accepted workerBondBp / 10,000 (EscrowV2.award). */
+/**
+ * The agreed worker bond, exactly as EscrowV2.award collects it: the verified clone's
+ * totalPrincipal() × its terms().workerBondBp / 10,000. The on-chain rate must equal the
+ * accepted order terms; a hosted rate is never used.
+ */
 export function acceptedV2WorkerBond(target: VerifiedV2Target, view: GetOrderResponse) {
-  const bp = z
-    .object({ workerBondBp: z.number().int().min(0).max(2000).optional() })
-    .safeParse(view.workOrder.terms).data?.workerBondBp;
-  if (target.pool || !bp || target.milestones.length !== 1)
+  const bp = target.terms?.workerBondBp;
+  if (target.pool || target.bounty || bp === undefined || target.milestones.length !== 1)
     return v2GuardFailure("The accepted task terms carry no worker bond.");
-  return (target.milestones.reduce((sum, m) => sum + m.amount, 0n) * BigInt(bp)) / 10_000n;
+  if (bp !== acceptedWorkerBondBp(view))
+    return v2GuardFailure("The escrow's worker bond differs from the accepted order terms.");
+  if (bp === 0) return v2GuardFailure("The accepted task terms carry no worker bond.");
+  return (target.total * BigInt(bp)) / 10_000n;
 }
 
 /** Decode every step, bind selector/arguments/destination to the requested action. */
