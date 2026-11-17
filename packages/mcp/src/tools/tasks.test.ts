@@ -2519,6 +2519,79 @@ describe("V2 jury and reviewer tools", () => {
     }
   });
 
+  it("keeps hosted echoes of a reveal out of tasks.vote and tasks.status results", async () => {
+    const echo = { salt: SALT, toWorker: "40000000" };
+    const leaks = (value: unknown) => {
+      const text = JSON.stringify(value);
+      return text.includes(SALT.slice(2, 18)) || text.includes("40000000");
+    };
+    const fake = juryChain();
+    const original = fake.executeV2.getMockImplementation()!;
+    fake.executeV2.mockImplementation(
+      async () => ({ ...(await original()), debug: echo }) as never,
+    );
+    const prepared = {
+      id: ESCROW,
+      kind: "tasks-v2-write",
+      state: "prepared",
+      step: "v2-reveal-vote",
+      expectedActor: RESOLVER,
+      transactionHash: null,
+      plan: {
+        version: "work-transaction-plan-v2",
+        operationId: ESCROW,
+        step: "v2-reveal-vote",
+        chainId: 84532,
+        network: "eip155:84532",
+        from: RESOLVER,
+        to: RESOLVER,
+        data: `0xdeadbeef${SALT.slice(2)}`,
+        value: "0",
+      },
+    };
+    const { server } = await watchServer({
+      client: {
+        operationV2: vi.fn(async () => ({
+          orderId: ID,
+          operation: prepared,
+          recovered: false,
+          scanComplete: true,
+          debug: echo,
+        })),
+        getOrder: vi.fn(async () => ({ workOrder: { id: ID }, lifecycle: null, nextAction: null })),
+      } as unknown as TasksClient,
+      chain: fake.chain,
+      now: () => new Date(NOW),
+    });
+    const voted = await server.callTool({
+      name: "tasks.vote",
+      arguments: { id: ID, i: 0, action: "reveal" },
+    });
+    expect(voted.isError).not.toBe(true);
+    expect(leaks(voted)).toBe(false);
+    fake.executeV2.mockRejectedValueOnce(
+      new TasksClientError("http", `bad reveal ${JSON.stringify(echo)}`, 409, SALT.slice(2)),
+    );
+    const failed = await server.callTool({
+      name: "tasks.vote",
+      arguments: { id: ID, i: 0, action: "reveal" },
+    });
+    expect(failed.isError).toBe(true);
+    expect(JSON.parse((failed.content as Array<{ text: string }>)[0]!.text).code).toBe(
+      "v2_vote_rejected",
+    );
+    expect(leaks(failed)).toBe(false);
+    const status = await server.callTool({
+      name: "tasks.status",
+      arguments: { id: ID, operationId: ESCROW, step: "v2-reveal-vote" },
+    });
+    expect(status.isError, JSON.stringify(status)).not.toBe(true);
+    expect(status.structuredContent).toMatchObject({
+      operation: { plan: { data: "[redacted: reveal calldata]" } },
+    });
+    expect(leaks(status)).toBe(false);
+  });
+
   it("validates jury and vote arguments before any signing", async () => {
     const fake = juryChain();
     const { server } = await watchServer({

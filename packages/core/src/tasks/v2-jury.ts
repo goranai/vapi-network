@@ -34,6 +34,8 @@ import { executeTaskV2, type TaskV2ExecutionInput } from "./v2-execution.js";
 import { v2Read, verifiedV2Case, verifiedV2Resolver, verifyV2Target } from "./v2-plan-guard.js";
 import { getTrustedTasksV2Deployment, type TasksV2DeploymentOverrides } from "./v2-trust.js";
 import { taskV2IndexSchema, type TaskV2Action } from "./v2-write.js";
+import { TasksClientError } from "./client.js";
+import { publicTaskV2OperationOf, taskV2VoteHostedError } from "./v2-public.js";
 import type { PublicClient } from "viem";
 
 /** DisputeResolverV3 case states (vapi-app tasks-v2.ts CaseState). Snapshotting was appended. */
@@ -346,30 +348,103 @@ export const taskV2VoteInputSchema = z
   });
 export type TaskV2VoteInput = z.input<typeof taskV2VoteInputSchema>;
 
+/** Error codes this SDK raises itself on vote paths; any other code is replaced. */
+const LOCAL_VOTE_ERROR_CODES = new Set([
+  "already_committed",
+  "ballot_store_unavailable",
+  "ballot_unavailable",
+  "chain_error",
+  "chain_unavailable",
+  "commitment_unavailable",
+  "invalid_commitment",
+  "invalid_input",
+  "invalid_response",
+  "no_commitment",
+  "operation_pending",
+  "reveal_not_open",
+  "reveal_unavailable",
+  "reveal_window_closed",
+  "transaction_reverted",
+  "v2_plan_mismatch",
+  "v2_resolver_unavailable",
+  "v2_trust_unavailable",
+  "v2_vote_rejected",
+  "vote_failed",
+]);
+const VOTE_FAILED =
+  "The vote step failed. The sealed ballot stays on this machine; retry the same command.";
+
+/** Only the documented operation fields leave a vote step; the reveal calldata is redacted. */
+function publicVoteDetails(details: Record<string, unknown> | undefined, secret: boolean) {
+  if (!details) return undefined;
+  const operation = publicTaskV2OperationOf(details.operation, secret);
+  return {
+    ...(typeof details.orderId === "string" ? { orderId: details.orderId } : {}),
+    ...(operation ? { operation } : {}),
+    ...(typeof details.operationId === "string" ? { operationId: details.operationId } : {}),
+    ...(typeof details.operationState === "string"
+      ? { operationState: details.operationState }
+      : {}),
+  };
+}
+
 /**
- * A failed vote step never echoes the ballot: the salt is scrubbed from every known error, and
- * any other error (an RPC client error quotes its call arguments) becomes a fixed message.
+ * A failed vote step never echoes the ballot. A hosted error is replaced by a fixed code and
+ * message (it may echo the request); an SDK error keeps its own code, with the salt and a split
+ * amount scrubbed from its message and only public operation fields in its details; anything
+ * else (an RPC client error quotes its call arguments) becomes vote_failed.
  */
-function sealedVoteError(error: unknown, salt?: Hex): never {
+function sealedVoteError(
+  error: unknown,
+  ballot?: Pick<TaskV2Ballot, "salt" | "toWorker">,
+  secret = false,
+): never {
   if (error instanceof TaskInputError) throw error;
-  if (!(error instanceof TaskOperationError))
+  if (error instanceof TasksClientError) throw taskV2VoteHostedError(error);
+  if (!(error instanceof TaskOperationError) || !LOCAL_VOTE_ERROR_CODES.has(error.code))
+    throw new TaskOperationError("vote_failed", VOTE_FAILED);
+  const secrets = ballot
+    ? [ballot.salt.slice(2), ...(ballot.toWorker === "0" ? [] : [ballot.toWorker])]
+    : [];
+  const scrub = (text: string) =>
+    secrets.reduce((value, item) => value.split(item).join("[redacted]"), text);
+  if (secrets.some((item) => error.message.toLowerCase().includes(item.toLowerCase())))
     throw new TaskOperationError(
-      "vote_failed",
-      "The vote step failed. The sealed ballot stays on this machine; retry the same command.",
+      error.code,
+      VOTE_FAILED,
+      undefined,
+      publicVoteDetails(error.details, secret),
     );
-  if (!salt) throw error;
-  const pattern = new RegExp(salt.slice(2), "giu");
-  const scrub = (text: string) => text.replace(pattern, "[redacted]");
-  const details = error.details
-    ? (JSON.parse(
-        scrub(
-          JSON.stringify(error.details, (_, value: unknown) =>
-            typeof value === "bigint" ? value.toString() : value,
-          ),
-        ),
-      ) as Record<string, unknown>)
-    : undefined;
-  throw new TaskOperationError(error.code, scrub(error.message), error.manifestHash, details);
+  throw new TaskOperationError(
+    error.code,
+    scrub(error.message),
+    undefined,
+    publicVoteDetails(error.details, secret),
+  );
+}
+
+/** The public result fields of a vote step; unknown hosted fields are never spread. */
+function publicVoteResult(
+  value: Awaited<ReturnType<typeof executeTaskV2>>,
+  ballot: { commitment: Hex; caseId: Hex; path: string },
+  secret: boolean,
+) {
+  const result = value as Record<string, unknown>;
+  const operation = publicTaskV2OperationOf(result.operation, secret);
+  return {
+    ok: result.ok === true,
+    ...(typeof result.reason === "string" ? { reason: result.reason } : {}),
+    ...(result.approval === true ? { approval: true as const } : {}),
+    ...(result.declined === true ? { declined: true as const } : {}),
+    ...("money" in value ? { money: value.money } : {}),
+    ...(typeof result.orderId === "string" ? { orderId: result.orderId } : {}),
+    ...(operation ? { operation } : {}),
+    ...(typeof result.operationId === "string" ? { operationId: result.operationId } : {}),
+    ...(typeof result.operationState === "string" ? { operationState: result.operationState } : {}),
+    lifecycle: result.lifecycle ?? null,
+    nextAction: result.nextAction ?? null,
+    ballot,
+  };
 }
 
 /**
@@ -401,15 +476,12 @@ export async function runTaskV2Vote(
     const result = await executeTaskV2(context, {
       ...base,
       write: { action: "commit-vote", i: vote.i, commitment: sealed.ballot.commitment },
-    }).catch((error: unknown) => sealedVoteError(error, sealed.ballot.salt));
-    return {
-      ...result,
-      ballot: {
-        commitment: sealed.ballot.commitment,
-        caseId: sealed.ballot.caseId,
-        path: sealed.path,
-      },
-    };
+    }).catch((error: unknown) => sealedVoteError(error, sealed.ballot));
+    return publicVoteResult(
+      result,
+      { commitment: sealed.ballot.commitment, caseId: sealed.ballot.caseId, path: sealed.path },
+      false,
+    );
   }
   const opened = await jury(context)
     .openBallot({ id: input.id, i: vote.i })
@@ -423,15 +495,12 @@ export async function runTaskV2Vote(
       toWorker: opened.ballot.toWorker,
       salt: opened.ballot.salt,
     },
-  }).catch((error: unknown) => sealedVoteError(error, opened.ballot.salt));
-  return {
-    ...result,
-    ballot: {
-      commitment: opened.ballot.commitment,
-      caseId: opened.ballot.caseId,
-      path: opened.path,
-    },
-  };
+  }).catch((error: unknown) => sealedVoteError(error, opened.ballot, true));
+  return publicVoteResult(
+    result,
+    { commitment: opened.ballot.commitment, caseId: opened.ballot.caseId, path: opened.path },
+    true,
+  );
 }
 
 /**

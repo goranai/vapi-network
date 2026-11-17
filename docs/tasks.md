@@ -467,7 +467,10 @@ reveal. Outcomes are `worker`, `poster` and `split` (DisputeResolverV3 order 0, 
 is USDC base units and only for `split`. The vote and its salt leave the machine only in the signed
 reveal transaction: results, progress and errors carry the commitment, case and ballot path, the
 reveal calldata is shown as `[redacted: reveal calldata]`, and an RPC error from `voteCommitment`
-(which quotes its arguments) becomes `commitment_unavailable`.
+(which quotes its arguments) becomes `commitment_unavailable`. A hosted error on a commit or reveal
+step is never copied, because it may echo the request: it becomes `v2_vote_rejected` with a fixed
+message. Results, errors and `status --operation` recovery or abandon output carry only documented
+fields; unknown hosted fields are dropped and reveal calldata is redacted by step and by selector.
 
 `reviewer-status` reads the chain directly. It takes the resolver from the pinned escrow factory's
 task implementation (`implementation()` then its immutable `DISPUTE_RESOLVER()`; the factory has no

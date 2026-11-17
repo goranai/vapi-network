@@ -3772,6 +3772,65 @@ describe("Tasks V2 jury and reviewer verbs", () => {
     expect(result.stdout.join("")).not.toContain(SALT.slice(2));
   });
 
+  it("keeps hosted echoes of a reveal out of CLI JSON and errors", async () => {
+    const echo = { salt: SALT, toWorker: "40000000" };
+    const leaks = (text: string) => text.includes(SALT.slice(2, 18)) || text.includes("40000000");
+    const f = await fixture();
+    const fake = juryChain();
+    const original = fake.executeV2.getMockImplementation()!;
+    fake.executeV2.mockImplementation(
+      async () => ({ ...(await original()), debug: echo, request: echo }) as never,
+    );
+    f.dependencies.tasks!.chain = fake.chain;
+    const ok = await invoke(["vote", ID, "--index", "0", "--reveal"], f.dependencies);
+    expect(ok.code).toBe(0);
+    expect(leaks(ok.stdout.join("\n") + ok.stderr.join("\n"))).toBe(false);
+    fake.executeV2.mockRejectedValueOnce(
+      new TasksClientError("http", `bad reveal ${JSON.stringify(echo)}`, 409, SALT.slice(2)),
+    );
+    const failed = await invoke(["vote", ID, "--index", "0", "--reveal"], f.dependencies);
+    expect(failed.code).toBe(1);
+    expect(failed.value).toMatchObject({ error: { code: "v2_vote_rejected" } });
+    expect(leaks(failed.stdout.join("\n") + failed.stderr.join("\n"))).toBe(false);
+  });
+
+  it("redacts a recovered prepared reveal in task status JSON", async () => {
+    const operation = {
+      ...v2TestOperation(),
+      state: "prepared" as const,
+      step: "v2-reveal-vote" as const,
+      transactionHash: null,
+      plan: {
+        ...v2TestOperation().plan,
+        step: "v2-reveal-vote" as const,
+        to: ADDRESS,
+        // revealVote(escrow, 0, Split, 40000000, salt)
+        data: `0xdeadbeef${SALT.slice(2)}` as `0x${string}`,
+      },
+    };
+    const f = await fixture(
+      true,
+      fakeClient({
+        operationV2: vi.fn(async () => ({
+          orderId: ID,
+          operation,
+          recovered: false,
+          scanComplete: true,
+          debug: { salt: SALT },
+        })) as never,
+      }),
+    );
+    const result = await invoke(
+      ["status", ID, "--operation", KEY, "--step", "v2-reveal-vote"],
+      f.dependencies,
+    );
+    expect(result.code).toBe(0);
+    expect(result.value).toMatchObject({
+      operation: { plan: { data: "[redacted: reveal calldata]" } },
+    });
+    expect(result.stdout.join("\n")).not.toContain(SALT.slice(2, 18));
+  });
+
   it("reveals the ballot read back by the onchain commitment", async () => {
     const f = await fixture();
     const fake = juryChain();

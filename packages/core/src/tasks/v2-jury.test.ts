@@ -24,12 +24,12 @@ import {
   type TaskV2Ballot,
 } from "./ballots.js";
 import type { TasksChainOptions } from "./chain.js";
-import type { TasksClient } from "./client.js";
+import { TasksClientError, type TasksClient } from "./client.js";
 import type { TaskOperationContext, TaskOperationError } from "./operation-support.js";
 import { createPendingTransactions } from "./pending-transactions.js";
 import { readSpendLedger } from "../spend-policy.js";
 import { disputeResolverV3Abi, escrowV2Abi } from "./v2-abi.js";
-import { createTaskV2Executor } from "./v2-execution.js";
+import { createTaskV2Executor, executeTaskV2, recoverTaskV2 } from "./v2-execution.js";
 import {
   createTaskV2Jury,
   readTaskV2ReviewerStatus,
@@ -782,6 +782,121 @@ describe("V2 vote commit and reveal", () => {
     await expect(
       runTaskV2Vote(f.context, { ...f.base, i: 0, action: "commit", outcome: "worker" }),
     ).rejects.toMatchObject({ code: "already_committed" });
+  });
+});
+
+describe("hosted echoes on vote paths", () => {
+  const SPLIT = "40000000";
+  const ECHO = { salt: SALT, toWorker: SPLIT, outcome: 2 };
+  /** Nothing a caller sees may contain the salt or the split amount. */
+  const leaks = (value: unknown) => {
+    const text = JSON.stringify(value, (_, v: unknown) =>
+      typeof v === "bigint" ? v.toString() : v,
+    );
+    return text.includes(SALT.slice(2, 18)) || text.includes(SPLIT);
+  };
+  const errorView = (error: unknown) => {
+    const e = error as TaskOperationError;
+    return { code: e.code, message: e.message, details: e.details };
+  };
+  async function splitBallot() {
+    const f = await fixture();
+    const sealed = await createTaskV2Jury(f.options).sealBallot({
+      id: V2_WRITE_ORDER,
+      i: 0,
+      outcome: 2,
+      toWorker: SPLIT,
+    });
+    f.chain.commitment = sealed.ballot.commitment;
+    const reveal = {
+      action: "reveal-vote",
+      i: 0,
+      outcome: 2,
+      toWorker: SPLIT,
+      salt: SALT,
+    } as const satisfies TaskV2Action;
+    return { f, reveal, prepared: operation(hostedPlan(reveal)) };
+  }
+
+  it("redacts a recovered or abandoned prepared reveal and its echoed fields", async () => {
+    const { f, prepared } = await splitBallot();
+    f.client.operationV2.mockImplementation((async (_id: string, mode: string) =>
+      mode === "abandon"
+        ? { orderId: V2_WRITE_ORDER, outcome: "recovered", operation: prepared.operation, ECHO }
+        : { ...prepared, recovered: true, scanComplete: true, debug: ECHO }) as never);
+    for (const step of ["v2-reveal-vote", "v2-approve"])
+      for (const abandon of [false, true]) {
+        const result = await recoverTaskV2(f.context, {
+          id: V2_WRITE_ORDER,
+          operationId: V2_WRITE_OPERATION,
+          step,
+          abandon,
+        });
+        expect(result.operation?.plan.data, `${step} ${abandon}`).toBe(
+          "[redacted: reveal calldata]",
+        );
+        expect(leaks(result), `${step} ${abandon}`).toBe(false);
+      }
+    f.client.operationV2.mockRejectedValue(
+      new TasksClientError("http", `no such step for salt ${SALT} / ${SPLIT}`, 409, SALT),
+    );
+    const error = await recoverTaskV2(f.context, {
+      id: V2_WRITE_ORDER,
+      operationId: V2_WRITE_OPERATION,
+      step: "v2-reveal-vote",
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "v2_vote_rejected" });
+    expect(leaks(errorView(error))).toBe(false);
+  });
+
+  it("never copies a hosted error code or message on a reveal (SDK, executor and vote)", async () => {
+    const { f, reveal } = await splitBallot();
+    const echo = () =>
+      new TasksClientError("http", `invalid reveal ${JSON.stringify(ECHO)}`, 409, SALT.slice(2));
+    f.client.prepareV2.mockImplementation(async () => {
+      throw echo();
+    });
+    const direct = createTaskV2Executor(f.options);
+    for (const run of [
+      () => runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" }),
+      () => executeTaskV2(f.context, { ...f.base, write: reveal }),
+      () => direct({ ...f.base, write: reveal }),
+    ]) {
+      const error = await run().catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: "v2_vote_rejected" });
+      expect(leaks(errorView(error))).toBe(false);
+    }
+    expect(f.rpc.sendRawTransaction).not.toHaveBeenCalled();
+  });
+
+  it("drops unknown hosted fields from a successful reveal (SDK, executor and vote)", async () => {
+    const { f, reveal } = await splitBallot();
+    const prepare = f.client.prepareV2.getMockImplementation()!;
+    const operate = f.client.operationV2.getMockImplementation()!;
+    f.client.prepareV2.mockImplementation(async (...args: Parameters<typeof prepare>) => ({
+      ...(await prepare(...args)),
+      debug: ECHO,
+    }));
+    f.client.operationV2.mockImplementation(async (...args: Parameters<typeof operate>) => ({
+      ...(await operate(...args)),
+      debug: ECHO,
+      request: { write: reveal },
+    }));
+    const voted = await runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" });
+    expect(voted, JSON.stringify(voted)).toMatchObject({
+      ok: true,
+      operation: { state: "confirmed" },
+    });
+    expect(leaks(voted)).toBe(false);
+    const g = (await splitBallot()).f;
+    g.client.prepareV2.mockImplementation(f.client.prepareV2.getMockImplementation()!);
+    g.client.operationV2.mockImplementation(async (...args: Parameters<typeof operate>) => ({
+      ...(await operate(...args)),
+      debug: ECHO,
+    }));
+    const direct = await createTaskV2Executor(g.options)({ ...g.base, write: reveal });
+    expect(direct).toMatchObject({ ok: true });
+    expect(leaks(direct)).toBe(false);
   });
 });
 
