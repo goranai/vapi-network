@@ -7,7 +7,18 @@
 // new dispute round may be raised. There is no mediation or appeal.
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 
-import { getAddress, parseAbi, toHex, zeroAddress, zeroHash, type Address, type Hex } from "viem";
+import {
+  encodeAbiParameters,
+  getAddress,
+  keccak256,
+  parseAbi,
+  parseAbiParameters,
+  toHex,
+  zeroAddress,
+  zeroHash,
+  type Address,
+  type Hex,
+} from "viem";
 import { z } from "zod";
 
 import {
@@ -73,6 +84,46 @@ const gateAbi = parseAbi([
   "function isEligible(address) view returns (bool)",
 ]);
 const stakingAbi = parseAbi(["function stakedBalance(address) view returns (uint256)"]);
+// DisputeResolverV3's public `disputeRound` mapping getter; not in the synced ABI.
+const disputeRoundAbi = parseAbi([
+  "function disputeRound(address escrow, uint8 milestone) view returns (uint32)",
+]);
+const caseIdParameters = parseAbiParameters("address, uint8, uint32");
+const commitmentParameters = parseAbiParameters(
+  "address, uint8, uint32, address, uint8, uint96, bytes32",
+);
+
+/** DisputeResolverV3 `_caseId`: keccak256(abi.encode(escrow, i, round)). */
+export function taskV2CaseId(escrow: Address, i: number, round: number): Hex {
+  return keccak256(encodeAbiParameters(caseIdParameters, [escrow, i, round]));
+}
+
+/**
+ * DisputeResolverV3 `_commitment`: keccak256(abi.encode(escrow, i, round, reviewer, outcome,
+ * toWorker, salt)), the same value its voteCommitment view returns for the current round.
+ * Computed on this machine so the vote and its salt never reach the RPC before the reveal.
+ */
+export function taskV2VoteCommitment(input: {
+  escrow: Address;
+  i: number;
+  round: number;
+  reviewer: Address;
+  outcome: number;
+  toWorker: bigint;
+  salt: Hex;
+}): Hex {
+  return keccak256(
+    encodeAbiParameters(commitmentParameters, [
+      input.escrow,
+      input.i,
+      input.round,
+      input.reviewer,
+      input.outcome,
+      input.toWorker,
+      input.salt,
+    ]),
+  );
+}
 
 const address = z
   .string()
@@ -97,7 +148,11 @@ export function createTaskV2Jury(options: TasksChainOptions) {
     return options.ballotsHome;
   };
 
-  /** The verified clone, its resolver (from the clone's DISPUTE_RESOLVER()) and the current round. */
+  /**
+   * The verified clone, its resolver (from the clone's DISPUTE_RESOLVER()), the current dispute
+   * round and its case id. The round is a public value read over RPC; the case id must be the
+   * one the round derives, so a commitment is never sealed for another round.
+   */
   async function voteCase(id: string, i: number) {
     taskV2IndexSchema.parse(i);
     const deployment = await client.deployment();
@@ -115,7 +170,18 @@ export function createTaskV2Jury(options: TasksChainOptions) {
     const caseId = hash.parse(
       await v2Read(target.rpc, resolver, disputeResolverV3Abi, "currentCaseId", at),
     );
-    return { target, resolver, caseId, at };
+    const round = z
+      .number()
+      .int()
+      .min(0)
+      .max(2 ** 32 - 1)
+      .parse(await v2Read(target.rpc, resolver, disputeRoundAbi, "disputeRound", at));
+    if (taskV2CaseId(target.escrow, i, round) !== caseId)
+      throw new TaskOperationError(
+        "invalid_response",
+        "The resolver's current case does not match its dispute round; retry the same vote.",
+      );
+    return { target, resolver, caseId, round, at };
   }
   async function onchainCommitment(
     rpc: PublicClient,
@@ -126,38 +192,20 @@ export function createTaskV2Jury(options: TasksChainOptions) {
       await v2Read(rpc, resolver, disputeResolverV3Abi, "commitments", [caseId, account.address]),
     );
   }
-  /**
-   * Never re-implement the hash: the resolver's own voteCommitment view is the preimage rule.
-   * An RPC error echoes the call arguments (the vote and its salt), so it is never propagated.
-   */
-  async function commitmentOf(
-    rpc: PublicClient,
-    resolver: Address,
+  /** The ballot's commitment for this wallet in `round`, computed locally (no RPC call). */
+  function commitmentOf(
+    round: number,
     ballot: Pick<TaskV2Ballot, "escrow" | "i" | "outcome" | "toWorker" | "salt">,
-  ): Promise<Hex> {
-    let value: unknown;
-    try {
-      value = await v2Read(rpc, resolver, disputeResolverV3Abi, "voteCommitment", [
-        getAddress(ballot.escrow),
-        ballot.i,
-        account.address,
-        ballot.outcome,
-        BigInt(ballot.toWorker),
-        ballot.salt,
-      ]);
-    } catch {
-      throw new TaskOperationError(
-        "commitment_unavailable",
-        "The resolver's voteCommitment view could not be read over RPC. Nothing was sent; retry the same vote.",
-      );
-    }
-    const commitment = hash.safeParse(value);
-    if (!commitment.success)
-      throw new TaskOperationError(
-        "invalid_commitment",
-        "The resolver returned a malformed commitment.",
-      );
-    return commitment.data;
+  ): Hex {
+    return taskV2VoteCommitment({
+      escrow: getAddress(ballot.escrow),
+      i: ballot.i,
+      round,
+      reviewer: account.address,
+      outcome: ballot.outcome,
+      toWorker: BigInt(ballot.toWorker),
+      salt: ballot.salt,
+    });
   }
 
   return {
@@ -185,12 +233,12 @@ export function createTaskV2Jury(options: TasksChainOptions) {
         );
     },
     /**
-     * Generate a 32-byte salt locally, compute the commitment over RPC and write the
+     * Generate a 32-byte salt locally, compute the commitment locally and write the
      * ballot (0600, fsync) before any commit plan is requested. A retry with the same
      * vote reuses its sealed ballot so the hosted preparation resumes.
      */
     async sealBallot(input: { id: string; i: number; outcome: 0 | 1 | 2; toWorker: string }) {
-      const { target, resolver, caseId } = await voteCase(input.id, input.i);
+      const { target, resolver, caseId, round } = await voteCase(input.id, input.i);
       const milestone = target.milestones[input.i];
       if (!milestone)
         throw new TaskInputError("The milestone index is outside the verified escrow.");
@@ -221,7 +269,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
         return { ballot: committed, reused: true, path: taskV2BallotPath(home(), committed) };
       }
       const previous = sealed.at(-1);
-      if (previous && (await commitmentOf(target.rpc, resolver, previous)) === previous.commitment)
+      if (previous && commitmentOf(round, previous) === previous.commitment)
         return { ballot: previous, reused: true, path: taskV2BallotPath(home(), previous) };
       const salt = toHex(randomBytes(32));
       const draft = {
@@ -231,12 +279,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
         toWorker: input.toWorker,
         salt,
       };
-      const commitment = await commitmentOf(target.rpc, resolver, draft);
-      if (commitment === zeroHash)
-        throw new TaskOperationError(
-          "invalid_commitment",
-          "The resolver returned an empty commitment.",
-        );
+      const commitment = commitmentOf(round, draft);
       const ballot: TaskV2Ballot = {
         version: "vapi-tasks-ballot-v1",
         orderId: input.id,
@@ -253,7 +296,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
     },
     /** The ballot whose commitment is onchain for this wallet in the current round. */
     async openBallot(input: { id: string; i: number }) {
-      const { target, resolver, caseId } = await voteCase(input.id, input.i);
+      const { target, resolver, caseId, round } = await voteCase(input.id, input.i);
       // Never hand the salt to the hosted API outside the reveal window: others could still
       // commit after seeing it. Resolver state and the chain clock decide, as revealVote does.
       const { data } = await verifiedV2Case(target, input.i);
@@ -291,7 +334,7 @@ export function createTaskV2Jury(options: TasksChainOptions) {
           "ballot_unavailable",
           "No local ballot matches the onchain commitment. Reveal from the machine that committed.",
         );
-      if ((await commitmentOf(target.rpc, resolver, ballot)) !== onchain)
+      if (commitmentOf(round, ballot) !== onchain)
         throw new TaskOperationError(
           "invalid_commitment",
           "The stored ballot no longer matches its onchain commitment.",
@@ -360,7 +403,6 @@ const LOCAL_VOTE_ERROR_CODES = new Set([
   "ballot_unavailable",
   "chain_error",
   "chain_unavailable",
-  "commitment_unavailable",
   "invalid_commitment",
   "invalid_input",
   "invalid_response",

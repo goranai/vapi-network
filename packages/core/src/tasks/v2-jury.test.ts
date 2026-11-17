@@ -8,7 +8,6 @@ import {
   getAddress,
   keccak256,
   parseAbi,
-  toHex,
   zeroAddress,
   zeroHash,
   type Hex,
@@ -35,6 +34,8 @@ import {
   readTaskV2ReviewerStatus,
   runTaskV2Jury,
   runTaskV2Vote,
+  taskV2CaseId,
+  taskV2VoteCommitment,
 } from "./v2-jury.js";
 import { acceptedV2TermsHash, verifyV2Plan, verifyV2Target } from "./v2-plan-guard.js";
 import { taskV2OperationResponseSchema, type TaskV2Action } from "./v2-write.js";
@@ -66,7 +67,9 @@ const POOL_FACTORY = getAddress(`0x${"66".repeat(20)}`);
 const RESOLVER = getAddress(`0x${"99".repeat(20)}`);
 const IMPLEMENTATION = getAddress(`0x${"67".repeat(20)}`);
 const OTHER = getAddress(`0x${"bb".repeat(20)}`);
-const CASE_ID = `0x${"c1".repeat(32)}` as Hex;
+const ROUND = 1;
+// keccak256(abi.encode(ESCROW, 0, ROUND)), DisputeResolverV3 `_caseId`; see the vector test.
+const CASE_ID = "0xba4627d02ca66c0baf94b16a1d1976338b69f2a517570fb9b91e993e361ffcaf" as Hex;
 const DEADLINE = "2026-10-28T12:00:00.000Z";
 const NOW_SECONDS = BigInt(Date.parse("2026-10-26T12:00:00Z") / 1000);
 const PIN = {
@@ -115,15 +118,17 @@ function view(workerBondBp?: number) {
     nextAction: { action: "judge" },
   };
 }
-/** Deterministic stand-in for the resolver's own voteCommitment view. */
-function fakeCommitment(args: readonly unknown[]): Hex {
-  return keccak256(
-    toHex(
-      JSON.stringify(args, (_, v: unknown) =>
-        typeof v === "bigint" ? v.toString() : typeof v === "string" ? v.toLowerCase() : v,
-      ),
-    ),
-  );
+/** DisputeResolverV3 `_commitment` for this wallet in ROUND, as the contract computes it. */
+function contractCommitment(i: number, outcome: number, toWorker: bigint, salt: Hex): Hex {
+  return taskV2VoteCommitment({
+    escrow: ESCROW,
+    i,
+    round: ROUND,
+    reviewer: account.address,
+    outcome,
+    toWorker,
+    salt,
+  });
 }
 
 /** What the hosted builder encodes for each write; the guard decodes and binds it locally. */
@@ -208,6 +213,7 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
   const order = view(options.workerBondBp);
   const chain = {
     commitment: zeroHash as Hex,
+    round: ROUND,
     // Queued caseData states; Voting (4) once the queue is empty.
     caseStates: [] as number[],
     evidenceDeadline: NOW_SECONDS - 3600n,
@@ -286,11 +292,15 @@ async function fixture(options: { worker?: string; workerBondBp?: number } = {})
           case "DISPUTE_RESOLVER":
             return chain.resolverOnClone;
           case "currentCaseId":
-            return CASE_ID;
+            return taskV2CaseId(
+              getAddress(call.args![0] as string),
+              Number(call.args![1]),
+              chain.round,
+            );
+          case "disputeRound":
+            return chain.round;
           case "commitments":
             return chain.commitment;
-          case "voteCommitment":
-            return fakeCommitment(call.args!);
           case "caseData":
             return {
               state: chain.caseStates.shift() ?? 4,
@@ -611,9 +621,7 @@ describe("V2 vote commit and reveal", () => {
     const write = f.writes[0]!;
     expect(write).toEqual({ action: "commit-vote", i: 0, commitment: result.ballot.commitment });
     expect(JSON.stringify(write)).not.toContain(SALT.slice(2));
-    expect(result.ballot.commitment).toBe(
-      fakeCommitment([ESCROW, 0, account.address, 2, 40000000n, SALT]),
-    );
+    expect(result.ballot.commitment).toBe(contractCommitment(0, 2, 40000000n, SALT));
     const stored = JSON.parse(await readFile(result.ballot.path, "utf8")) as TaskV2Ballot;
     expect(stored).toMatchObject({ outcome: 2, toWorker: "40000000", salt: SALT });
   });
@@ -692,31 +700,57 @@ describe("V2 vote commit and reveal", () => {
     expect(f.rpc.readContract).not.toHaveBeenCalled();
   });
 
-  it("never surfaces the salt when the voteCommitment RPC read fails", async () => {
+  it("computes the commitment and case id exactly as DisputeResolverV3 does", () => {
+    // Fixed vectors from Foundry against DisputeResolverV3 `_commitment` / `_caseId`
+    // (contracts/src/DisputeResolverV3.sol: keccak256(abi.encode(...))), reviewer = this
+    // test account (0xAe72A48c1a36bd18Af168541c53037965d26e4A8):
+    //   cast keccak $(cast abi-encode "f(address,uint8,uint32,address,uint8,uint96,bytes32)" \
+    //     0x2222222222222222222222222222222222222222 0 1 0xAe72A48c1a36bd18Af168541c53037965d26e4A8 \
+    //     2 40000000 0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a)
+    //   cast keccak $(cast abi-encode "f(address,uint8,uint32)" \
+    //     0x2222222222222222222222222222222222222222 0 1)
+    expect(account.address).toBe("0xAe72A48c1a36bd18Af168541c53037965d26e4A8");
+    expect(contractCommitment(0, 2, 40000000n, SALT)).toBe(
+      "0x862791faf680653faf4fc752c50c2e09de0be3cdf02d846e53e0844cbe40b34a",
+    );
+    expect(taskV2CaseId(ESCROW, 0, ROUND)).toBe(CASE_ID);
+  });
+
+  it("never sends the vote or its salt over RPC while committing or revealing", async () => {
     const f = await fixture();
-    const original = f.rpc.readContract.getMockImplementation()!;
-    f.rpc.readContract.mockImplementation(async (call) => {
-      if (call.functionName === "voteCommitment")
-        // viem's ContractFunctionExecutionError quotes every call argument.
-        throw new Error(
-          `The contract function "voteCommitment" reverted. Args: ${JSON.stringify(
-            call.args,
-            (_, v: unknown) => (typeof v === "bigint" ? v.toString() : v),
-          )}`,
-        );
-      return original(call);
-    });
-    const error = await runTaskV2Vote(f.context, {
+    const result = await runTaskV2Vote(f.context, {
       ...f.base,
       i: 0,
       action: "commit",
       outcome: "split",
       toWorker: "40000000",
-    }).catch((caught: unknown) => caught);
-    expect(error).toMatchObject({ code: "commitment_unavailable" });
-    expect(String((error as Error).message)).not.toContain(SALT.slice(2, 18));
-    expect(String((error as Error).message)).not.toContain("40000000");
+    });
+    expect(result.ballot.commitment).toBe(contractCommitment(0, 2, 40000000n, SALT));
+    f.chain.commitment = result.ballot.commitment;
+    await runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" });
+    const calls = JSON.stringify(f.rpc.readContract.mock.calls, (_, v: unknown) =>
+      typeof v === "bigint" ? v.toString() : v,
+    ).toLowerCase();
+    expect(calls).not.toContain(SALT.slice(2, 18));
+    expect(calls).not.toContain("40000000");
+    expect(f.rpc.readContract.mock.calls.map(([call]) => call.functionName)).not.toContain(
+      "voteCommitment",
+    );
+  });
+
+  it("refuses to seal a ballot when the case id does not match the dispute round", async () => {
+    const f = await fixture();
+    const original = f.rpc.readContract.getMockImplementation()!;
+    f.rpc.readContract.mockImplementation(async (call) =>
+      call.functionName === "disputeRound" ? ROUND + 1 : original(call),
+    );
+    await expect(
+      runTaskV2Vote(f.context, { ...f.base, i: 0, action: "commit", outcome: "poster" }),
+    ).rejects.toMatchObject({ code: "invalid_response" });
     expect(f.client.prepareV2).not.toHaveBeenCalled();
+    await expect(
+      listTaskV2Ballots(f.home, { chainId: 84532, resolver: RESOLVER, caseId: CASE_ID }),
+    ).resolves.toEqual([]);
   });
 
   it("keeps the salt out of reveal results, progress and signing errors", async () => {
