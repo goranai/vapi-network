@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createTasksClient, TasksClientError } from "./client.js";
+import { missingTasksChain } from "./chain-port.js";
+import { createTasksClient, TasksClientError, type TasksClient } from "./client.js";
+import { showTask, taskStatus } from "./operations.js";
 import { freezeScopeTerms } from "./scope-terms.js";
 import { tasksResponseSchemas } from "./types.js";
 import type {
@@ -1283,5 +1285,137 @@ describe("recorded Tasks v2 boundaries (hosted T7)", () => {
     expect(await client.fundingChallenge(ID)).toBeNull();
     await expect(client.fundingChallenge(ID)).rejects.toMatchObject({ status: 302 });
     expect(recorder.requests[0]!.redirect).toBe("manual");
+  });
+});
+
+describe("plain show and status keep unrevealed ballots out (hosted echoes)", () => {
+  const SALT = `0x${"5a".repeat(32)}`;
+  const SPLIT = "40000000";
+  // DisputeResolverV3 revealVote selector followed by its arguments, as a prepared reveal plan.
+  const REVEAL = `0x583b7b7c${"00".repeat(31)}02${SALT.slice(2)}`;
+  const echo = () => ({
+    write: { action: "reveal-vote", i: 0, outcome: 2, toWorker: SPLIT, salt: SALT },
+    operation: {
+      id: OTHER_ID,
+      kind: "tasks-v2-write",
+      state: "prepared",
+      step: "v2-reveal-vote",
+      plan: { step: "v2-reveal-vote", to: ADDRESS, data: REVEAL, value: "0" },
+    },
+    steps: [{ kind: "v2-commit-vote", data: `0x1234${"ab".repeat(32)}`, outcome: 1 }],
+    nested: { deeper: [{ salt: SALT }], raw: REVEAL },
+  });
+  const revealed = { reviewer: ADDRESS, outcome: 2, toWorker: SPLIT, revealed: true };
+  const context = (fetch: typeof globalThis.fetch) => ({
+    client: createTasksClient({ baseUrl: "https://tasks.example", fetch, token: "t" }),
+    chain: missingTasksChain,
+    baseUrl: "https://tasks.example",
+    randomUUID: () => KEY,
+    signInHint: "Run vapi login.",
+  });
+  const leaks = (value: unknown) => {
+    const text = JSON.stringify(value);
+    return {
+      salt: text.toLowerCase().includes(SALT.slice(2, 18)),
+      reveal: text.toLowerCase().includes("0x583b7b7c"),
+      write: text.includes('"reveal-vote","i":0,"outcome"'),
+    };
+  };
+  const clean = { salt: false, reveal: false, write: false };
+
+  it("removes a nested prepared reveal from show and keeps revealed chain votes", async () => {
+    const { fetch } = recordedFetch(
+      json({
+        workOrder: {
+          ...privateOrder,
+          debug: echo(),
+          v2State: { escrow: ADDRESS, votes: [revealed] },
+        },
+        prepared: echo(),
+      }),
+    );
+    const result = (await showTask(context(fetch), { id: ID, signedIn: true })) as unknown as {
+      workOrder: Record<string, unknown> & { v2State: unknown; debug: Record<string, unknown> };
+    };
+    expect(leaks(result)).toEqual(clean);
+    expect(result.workOrder.v2State).toEqual({ escrow: ADDRESS, votes: [revealed] });
+    expect(result.workOrder.debug.operation).toMatchObject({
+      step: "v2-reveal-vote",
+      plan: { data: "[redacted: reveal calldata]" },
+    });
+    expect(result.workOrder.debug.write).toEqual({ action: "reveal-vote", i: 0 });
+    expect(result.workOrder).toMatchObject({ id: ID, title: privateOrder.title });
+  });
+
+  it("removes nested salts and vote calldata from status chain state and events", async () => {
+    const { fetch } = recordedFetch(
+      json({ workOrderId: ID, milestones: [], observedAt: NOW, pending: { vote: echo() } }),
+      json({
+        events: [
+          { sequence: 2, type: "v2.prepared", at: NOW, actor: ADDRESS, payload: echo() },
+          { sequence: 1, type: "v2.revealed", at: NOW, actor: ADDRESS, payload: revealed },
+        ],
+        nextAfter: 2,
+      }),
+    );
+    const result = (await taskStatus(context(fetch), { id: ID, signedIn: true })) as {
+      chainState: unknown;
+      events: { sequence: number; payload: unknown }[] | null;
+    };
+    expect(leaks(result)).toEqual(clean);
+    expect(result.events?.map((e) => e.sequence)).toEqual([1, 2]);
+    expect(result.events?.[0]!.payload).toEqual(revealed);
+    expect(result.chainState).toMatchObject({ workOrderId: ID, observedAt: NOW });
+  });
+
+  it("withholds an echoed vote in show and status HTTP and transport errors", async () => {
+    const body = `prepared reveal {"salt":"${SALT}","toWorker":"${SPLIT}"}`;
+    for (const read of ["show", "status"] as const)
+      for (const mode of ["http", "transport"] as const) {
+        const fetch = vi.fn(async () => {
+          if (mode === "transport") throw new TypeError(`fetch failed: ${body}`);
+          return json({ error: { code: "echo", message: body } }, { status: 500 });
+        }) as unknown as typeof globalThis.fetch;
+        const error = await (
+          read === "show"
+            ? showTask(context(fetch), { id: ID, signedIn: true })
+            : taskStatus(context(fetch), { id: ID, signedIn: true })
+        ).catch((caught: unknown) => caught as Error & { code: string; details?: unknown });
+        const text = JSON.stringify({
+          code: (error as { code?: string }).code,
+          message: (error as Error).message,
+          details: (error as { details?: unknown }).details,
+        });
+        expect(text, `${read} ${mode}`).not.toContain(SALT.slice(2, 18));
+        expect(text, `${read} ${mode}`).not.toContain(SPLIT);
+        expect(error, `${read} ${mode}`).toMatchObject(
+          mode === "http"
+            ? { code: "echo", message: expect.stringContaining("(HTTP 500)") }
+            : { code: "network", message: expect.stringContaining("withheld") },
+        );
+      }
+  });
+
+  it("keeps ordinary hosted errors and the signed-out read unchanged", async () => {
+    const fetch = vi.fn(async () =>
+      json(
+        { error: { code: "work_order_not_found", message: "Work order not found" } },
+        {
+          status: 404,
+        },
+      ),
+    ) as unknown as typeof globalThis.fetch;
+    await expect(showTask(context(fetch), { id: ID, signedIn: true })).rejects.toMatchObject({
+      code: "work_order_not_found",
+      message: "Work order not found",
+    });
+    const task = { id: ID, title: "Audit", receiptUrl: null, extra: { salt: SALT } };
+    const client = { publicTask: vi.fn().mockResolvedValue(task) } as unknown as TasksClient;
+    const shown = await showTask({ ...context(fetch), client }, { id: ID, signedIn: false });
+    expect(shown).toEqual({
+      task: { id: ID, title: "Audit", receiptUrl: null, extra: {} },
+      lifecycle: null,
+      nextAction: { action: "none" },
+    });
   });
 });

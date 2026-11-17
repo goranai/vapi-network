@@ -7,7 +7,7 @@ import { toFunctionSelector } from "viem";
 import { z } from "zod";
 
 import { TasksClientError } from "./client.js";
-import { TaskOperationError } from "./operation-support.js";
+import { TaskInputError, TaskOperationError } from "./operation-support.js";
 import { disputeResolverV3Abi } from "./v2-abi.js";
 import type { TaskLifecycle, TaskNextAction } from "./v2.js";
 import type { TaskV2Action, TaskV2Consent, TaskV2Operation } from "./v2-write.js";
@@ -236,4 +236,106 @@ export function taskV2VoteHostedError(error: unknown) {
       error instanceof TasksClientError && error.status ? ` (HTTP ${error.status})` : ""
     }. The sealed ballot stays on this machine; check the case state and retry.`,
   );
+}
+
+/** Keys that hold a sealed ballot inside a vote request, step or operation. */
+const BALLOT_FIELDS = new Set(["outcome", "toWorker", "salt", "vote", "ballot"]);
+const VOTE_ACTIONS: readonly string[] = ["commit-vote", "reveal-vote", ...TASK_V2_SECRET_STEPS];
+const isRevealCalldata = (value: string) =>
+  value.length > REVEAL_SELECTOR.length && value.toLowerCase().startsWith(REVEAL_SELECTOR);
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+/** A step, operation or request whose kind, step or action is a V2 commit or reveal vote. */
+function isVoteContext(source: Record<string, unknown>) {
+  const named = (value: unknown) => typeof value === "string" && VOTE_ACTIONS.includes(value);
+  const plan = plainRecord(source.plan);
+  return (
+    named(source.step) ||
+    named(source.kind) ||
+    named(source.action) ||
+    (plan !== undefined && named(plan.step)) ||
+    (typeof source.data === "string" && isRevealCalldata(source.data))
+  );
+}
+
+/**
+ * A hosted read (plain `show` and `status`) with every unrevealed ballot removed, at any depth:
+ * every `salt` key; inside a commit or reveal vote step, operation or request, its calldata
+ * (`data`) and its ballot fields (outcome, toWorker, salt, vote, ballot); and any reveal
+ * calldata string. Everything else, including reveal outcomes in public chain state, is kept.
+ */
+export function redactTaskV2Ballots<T>(value: T): T {
+  const walk = (item: unknown, vote: boolean): unknown => {
+    if (typeof item === "string") return isRevealCalldata(item) ? TASK_V2_REDACTED_CALLDATA : item;
+    if (Array.isArray(item)) return item.map((entry: unknown) => walk(entry, vote));
+    const source = plainRecord(item);
+    if (!source) return item;
+    const inside = vote || isVoteContext(source);
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(source)) {
+      if (/^salt$/iu.test(key) || (inside && BALLOT_FIELDS.has(key))) continue;
+      out[key] =
+        inside && key === "data" && typeof entry === "string"
+          ? TASK_V2_REDACTED_CALLDATA
+          : walk(entry, inside);
+    }
+    return out;
+  };
+  return walk(value, false) as T;
+}
+
+/** A 32-byte hex value (a salt-like value) or a named vote field in an error message. */
+const ECHOED_VOTE = /(?:0x)?[0-9a-f]{64}|\bsalt\b|toWorker|(?:reveal|commit)[-_ ]?vote/iu;
+const SAFE_SERVER_CODE = /^[a-z0-9_.-]{1,64}$/iu;
+
+/**
+ * One hosted call of a plain `show` or `status` read. A hosted error, or a transport error
+ * quoting the response, may echo a prepared vote: a message that carries a salt-like value or
+ * a vote field is replaced by a fixed message with only the HTTP status, before the usual
+ * error mapping (sign-in, not found, unavailable route) runs on its status and code.
+ */
+export async function taskReadWithoutBallots<T>(verb: string, call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    const withheld = (status?: number) =>
+      `The hosted API returned an error for ${verb}${
+        status ? ` (HTTP ${status})` : ""
+      }; its message was withheld because it may echo a vote. Retry the same command.`;
+    if (error instanceof TasksClientError) {
+      const serverCode =
+        error.serverCode && SAFE_SERVER_CODE.test(error.serverCode) ? error.serverCode : undefined;
+      if (ECHOED_VOTE.test(error.message) || serverCode !== error.serverCode)
+        throw new TasksClientError(
+          error.code,
+          withheld(error.status),
+          error.status,
+          serverCode,
+          error.retryAfter,
+        );
+      throw error;
+    }
+    if (error instanceof TaskInputError) {
+      if (ECHOED_VOTE.test(error.message)) throw new TaskInputError(withheld());
+      throw error;
+    }
+    if (error instanceof TaskOperationError) {
+      if (ECHOED_VOTE.test(error.message) || error.details)
+        throw new TaskOperationError(
+          error.code,
+          ECHOED_VOTE.test(error.message) ? withheld() : error.message,
+          error.manifestHash,
+          error.details && redactTaskV2Ballots(error.details),
+        );
+      throw error;
+    }
+    if (error instanceof Error && ECHOED_VOTE.test(`${error.message} ${String(error.cause)}`))
+      throw new TasksClientError("network", withheld());
+    throw error;
+  }
 }
