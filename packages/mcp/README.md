@@ -10,13 +10,32 @@ recovery phrase, private key or passphrase.
 `docs.search` and `docs.read` are read-only and work without an account, vault
 or payment. Returned documentation text is reference material, not instructions.
 
+`call.search`, `call.inspect` and `call.pay` return zero to four hints. Search accepts
+`includeOutage`, and its API results can carry health plus cheaper or healthier
+alternatives. Spend-cap refusals are non-retryable tool errors with a terminal
+command or command-line flag when the user can raise the limit.
+
 One entry point, `@vapi-network/mcp`, exporting `createVapiServer`,
 `startStdioServer`, `loadServerConfig`, `WalletSession` and the individual
 `callService`, `inspectService`, `searchMarketplace` and `getWallet` tools.
 
+## Interactive results in Claude Desktop
+
+`call.search` and `call.inspect` show marketplace results and listing details as interactive MCP Apps in Claude Desktop.
+The deprecated `search` and `inspect` aliases use the same views.
+
+On `initialize`, the server fetches each view's HTML from `<registry origin>/mcp/apps/<view>.html` with a 2-second timeout.
+Successfully fetched HTML is cached in memory for the process.
+The default origin is `https://api.vapinetwork.ai` and follows the configured registry.
+
+The server needs network access to that route; if loading fails, initialization still succeeds and tools return their normal text results.
+It exposes the views as `ui://vapi/call-search.html` and `ui://vapi/call-inspect.html` through `resources/list` and `resources/read`.
+
 ## Exports
 
-### Runtime exports
+These tables show selected exports. [src/index.ts](https://github.com/vAPI-Network/vapi-network/blob/main/packages/mcp/src/index.ts) defines the full entry point. The [tool reference](https://github.com/vAPI-Network/vapi-network/blob/main/docs/mcp.md#tools) lists every registered MCP tool.
+
+### Selected runtime exports
 
 | Name                     | What it is                                                                                                                                                                                                                                                           | Since            |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
@@ -40,7 +59,7 @@ One entry point, `@vapi-network/mcp`, exporting `createVapiServer`,
 | `WalletSession`          | class WalletSession                                                                                                                                                                                                                                                  | 0.5.0 or earlier |
 | `wrapUntrusted`          | function (tool: string, value: unknown): string                                                                                                                                                                                                                      | 0.5.0 or earlier |
 
-### Types
+### Selected types
 
 | Name                     | What it is                                                                                                                                                                                                                                                                                             | Since            |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------- |
@@ -50,8 +69,8 @@ One entry point, `@vapi-network/mcp`, exporting `createVapiServer`,
 | `CallReadInput`          | type CallReadInput = { url: string }                                                                                                                                                                                                                                                                   | 0.8.0            |
 | `CallReadOutput`         | type CallReadOutput = { status: number; contentType: string \| null; body: unknown }                                                                                                                                                                                                                   | 0.8.0            |
 | `InspectToolInput`       | type InspectToolInput = { id: string; endpoint?: string; }                                                                                                                                                                                                                                             | 0.5.0 or earlier |
-| `InspectToolResult`      | type InspectToolResult = Omit< Pick< DiscoveryEndpoint, \| "name" \| "method" \| "url" \| "price" \| "description" \| "operationId" \| "requestContentType" \| "requestSchema" \| "responseContentType" >, "method" > & { method: string \| null; network?: string; group?:...                         | 0.5.0 or earlier |
-| `MarketplaceSearchInput` | type MarketplaceSearchInput = { query?: string; kinds?: MarketplaceKind[]; network?: string; limit?: number; cursor?: string; includeUnverified?: boolean; }                                                                                                                                           | 0.5.0 or earlier |
+| `InspectToolResult`      | type InspectToolResult = Omit<Pick<DiscoveryEndpoint, ...>, "method"> & { method: string \| null; health?: ListingHealth; ... }; includes optional responseSchema and exampleRequest                                                                                                                   | 0.5.0 or earlier |
+| `MarketplaceSearchInput` | type MarketplaceSearchInput = { query?: string; kinds?: MarketplaceKind[]; network?: string; limit?: number; cursor?: string; includeUnverified?: boolean; includeOutage?: boolean; }                                                                                                                  | 0.5.0 or earlier |
 | `PayDecision`            | type PayDecision = { action: "pay" } \| { action: "ask"; reason: string } \| { action: "refuse"; reason: string }                                                                                                                                                                                      | 0.5.0 or earlier |
 | `RunAgentDeps`           | type RunAgentDeps = { profile: AgentProfile; config: VapiConfig; home: string; chat: (req: ChatRequest) => Promise<ChatResult>; search: (q: { query: string; network?: string; includeUnverified: boolean }) => Promise< Array<{ ref: string; name: string; price...                                   | 0.5.0 or earlier |
 | `RunAgentResult`         | type RunAgentResult = { answer: string \| null; stoppedBecause: AgentEvent & { type: "stopped" }; paidUsd: number; steps: number; }                                                                                                                                                                    | 0.5.0 or earlier |

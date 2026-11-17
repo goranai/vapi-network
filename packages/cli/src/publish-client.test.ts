@@ -4,6 +4,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { verifyMessage, type Hex } from "viem";
 
 import {
+  apiKeyConsoleUrl,
   buildPayoutSiweMessage,
   createListingsClient,
   formatProbeSteps,
@@ -12,6 +13,7 @@ import {
   readProbeOperations,
   readProbeRejection,
   RegistryApiError,
+  type ProbeOperation,
   type ProbeResult,
 } from "./publish-client.js";
 
@@ -54,6 +56,20 @@ describe("listingsUrl", () => {
   });
 });
 
+describe("apiKeyConsoleUrl", () => {
+  it.each([
+    ["https://api.vapinetwork.ai", "https://api.vapinetwork.ai/connect?advanced=keys#api-keys"],
+    ["https://api.vapinetwork.ai/", "https://api.vapinetwork.ai/connect?advanced=keys#api-keys"],
+    ["https://example.test/vapi/", "https://example.test/vapi/connect?advanced=keys#api-keys"],
+    [
+      "https://api.vapinetwork.ai/?x=1#y",
+      "https://api.vapinetwork.ai/connect?advanced=keys#api-keys",
+    ],
+  ])("builds the API keys link for %s", (base, expected) => {
+    expect(apiKeyConsoleUrl(base).href).toBe(expected);
+  });
+});
+
 describe("the listing write API", () => {
   it("sends the key as a bearer token on every route", async () => {
     const probe = client({ body: { operations: [] } });
@@ -70,18 +86,13 @@ describe("the listing write API", () => {
     });
   });
 
-  it("asks for a payout nonce and a splitter state by wallet", async () => {
+  it("asks for a payout nonce by wallet", async () => {
     const nonce = client({ body: { nonce: "abcdef1234567890" } });
     await nonce.client.payoutNonce("0x1111111111111111111111111111111111111111");
     expect(nonce.requests[0]?.url.pathname).toBe("/api/call/listings/payout-nonce");
     expect(nonce.requests[0]?.url.searchParams.get("wallet")).toBe(
       "0x1111111111111111111111111111111111111111",
     );
-
-    const splitters = client({ body: { networkStates: [], feeBp: 500 } });
-    await splitters.client.splitters("0x1111111111111111111111111111111111111111");
-    expect(splitters.requests[0]?.url.pathname).toBe("/api/call/listings/splitters");
-    expect(splitters.requests[0]?.method).toBe("GET");
   });
 
   it("creates a listing and moves its status", async () => {
@@ -120,17 +131,22 @@ describe("registry errors", () => {
     expect((error as RegistryApiError).status).toBe(401);
     expect((error as Error).message).toContain("The vAPI API key was rejected.");
     expect((error as Error).message).toContain("unknown key");
-    expect((error as Error).message).toContain(`${BASE}/account`);
+    expect((error as Error).message).toContain(`${BASE}/connect?advanced=keys#api-keys`);
     expect((error as Error).message).toContain("vapi auth set-key");
   });
 
   it("passes a 409 refusal through in the registry's own words", async () => {
     const { client: listings } = client({
       status: 409,
-      body: { error: { message: "Deploy the splitter before activating this listing." } },
+      body: {
+        error: {
+          message:
+            "Set every endpoint's payTo to your payout wallet before activating this listing.",
+        },
+      },
     });
     await expect(listings.status("weather", "activate")).rejects.toThrow(
-      "Deploy the splitter before activating this listing.",
+      "Set every endpoint's payTo to your payout wallet before activating this listing.",
     );
   });
 
@@ -233,6 +249,25 @@ describe("reading a probe", () => {
   it("keeps only the operations that carry a name", () => {
     expect(readProbeOperations(probe).map((operation) => operation.name)).toEqual(["forecast"]);
     expect(readProbeOperations({})).toEqual([]);
+  });
+
+  it("reads a single payable endpoint the registry answers in `endpoint`", () => {
+    const endpoint = {
+      name: "GET weather.example/f",
+      method: "GET",
+      url: "https://weather.example/f",
+    };
+    expect(readProbeOperations({ endpoint, operations: [] })).toEqual([endpoint]);
+    expect(
+      readProbeOperations({
+        endpoint: { url: "https://weather.example/f" } as unknown as ProbeOperation,
+      }),
+    ).toEqual([]);
+    expect(
+      readProbeOperations({ endpoint, operations: [{ name: "forecast" }] }).map(
+        (operation) => operation.name,
+      ),
+    ).toEqual(["forecast"]);
   });
 
   it("formats whatever shape the steps arrive in", () => {

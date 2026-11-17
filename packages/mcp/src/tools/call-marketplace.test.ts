@@ -43,15 +43,15 @@ describe("Agent Cash marketplace call boundary", () => {
       vi.useFakeTimers();
       const directory = await mkdtemp(join(tmpdir(), "vapi-paid-timeout-"));
       temporaryDirectories.push(directory);
-      let paidFetchStarted!: () => void;
-      const paidFetch = new Promise<void>((resolve) => {
-        paidFetchStarted = resolve;
+      let markPaidRequestStarted!: () => void;
+      const paidRequestStarted = new Promise<void>((resolve) => {
+        markPaidRequestStarted = resolve;
       });
       const fetchImpl = vi
         .fn<typeof fetch>()
         .mockResolvedValueOnce(paymentRequired(PAY_TO, offerSeconds))
         .mockImplementationOnce(async (input) => {
-          paidFetchStarted();
+          markPaidRequestStarted();
           return await abortedFetch(input);
         });
 
@@ -69,19 +69,18 @@ describe("Agent Cash marketplace call boundary", () => {
         receiptsPath: join(directory, "receipts.jsonl"),
         ...(internalTimeoutMs === undefined ? {} : { timeoutMs: internalTimeoutMs }),
       });
-      // Actual filesystem I/O must finish before advancing the fake paid timer.
-      // Surface an early failure instead of leaving the handshake unresolved.
-      await Promise.race([
-        paidFetch,
-        call.then(() => {
-          throw new Error("Expected the paid fetch before completion.");
-        }),
-      ]);
-      expect(fetchImpl).toHaveBeenCalledTimes(2);
       let rejected = false;
-      void call.catch(() => {
-        rejected = true;
-      });
+      const earlyCompletion = call.then(
+        () => {
+          throw new Error("Paid call resolved before its request started.");
+        },
+        (error: unknown) => {
+          rejected = true;
+          throw error;
+        },
+      );
+      await Promise.race([paidRequestStarted, earlyCompletion]);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(expectedSeconds * 1_000 - 1);
       expect(rejected).toBe(false);
       await vi.advanceTimersByTimeAsync(1);

@@ -68,6 +68,7 @@ const NOW_SECONDS = BigInt(Date.parse("2026-10-26T12:00:00Z") / 1000);
 const DEADLINE = "2026-10-28T12:00:00.000Z";
 const PIN = {
   escrowFactoryV2: FACTORY,
+  disputeResolverV3: RESOLVER,
   bountyPoolFactoryV1: POOL_FACTORY,
   usdc: USDC,
   usdcName: "USD Coin",
@@ -1020,6 +1021,46 @@ describe("review: settlement and refund previews", () => {
       expect(preview.mock.invocationCallOrder[0]).toBeLessThan(f.sign.mock.invocationCallOrder[0]!);
     },
   );
+  it("refuses unmatched settlement through a resolver that differs from the local pin", async () => {
+    const f = await fixture("v2-resolve-unmatched");
+    f.view.workOrder.v2State.milestones[0]!.status = "disputed";
+    f.view.workOrder.v2State.milestones[0]!.dispute = {
+      stage: "Raised",
+      matched: false,
+      raisedBy: WORKER,
+    };
+    f.prepared.operation.plan.data = encodeFunctionData({
+      abi: escrowV2Abi,
+      functionName: "resolveUnmatched",
+      args: [0],
+    });
+    const original = f.rpc.readContract.getMockImplementation()!;
+    f.rpc.readContract.mockImplementation(async (call) =>
+      call.functionName === "disputeResolver" ? `0x${"aa".repeat(20)}` : original(call),
+    );
+    const preview = vi.fn();
+    await expect(
+      f.execute({
+        ...f.input,
+        write: { action: "resolve-unmatched", i: 0 },
+        onMoney: preview,
+      }),
+    ).rejects.toMatchObject({
+      code: "v2_plan_mismatch",
+      message: "The factory dispute resolver differs from the local V2 deployment pin.",
+    });
+    expect(
+      f.rpc.readContract.mock.calls.some(([call]) =>
+        ["stage", "deadlines"].includes(call.functionName),
+      ),
+    ).toBe(false);
+    expect(f.rpc.getLogs).not.toHaveBeenCalled();
+    expect(preview).not.toHaveBeenCalled();
+    expect(f.sign).not.toHaveBeenCalled();
+    expect(f.typedSign).not.toHaveBeenCalled();
+    expect(f.rpc.sendRawTransaction).not.toHaveBeenCalled();
+    await expect(readFile(f.input.ledgerPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
   it.each(["no snapshot", "no dispute", "matched", "unclosed window", "unverified opener"])(
     "refuses unmatched settlement with %s",
     async (reason) => {

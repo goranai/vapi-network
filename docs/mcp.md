@@ -17,23 +17,22 @@ Add this to Claude Code, Claude Desktop or Cursor:
 }
 ```
 
-Then hand the passphrase to your operating system once, in your own terminal:
+Set up the device vault in your own terminal. If it is password protected, open a session before starting MCP:
 
 ```bash
-vapi unlock            # the passphrase goes into the macOS Keychain or libsecret
+vapi setup
+vapi vault unlock      # needed only for a password-protected vault
 ```
 
-The passphrase never leaves the machine and never has to appear in an editor's
-configuration file. A password-protected vault needs `VAPI_VAULT_PASSWORD` in
+The device key stays in the local OS secret store. A password-protected vault needs `VAPI_VAULT_PASSWORD` in
 the client entry or an open vault session. `vapi vault lock` closes that session.
 
 Give an agent its own capped account by creating it yourself and pinning the
 agent to it:
 
 ```bash
-vapi wallet create agent-claude --label "claude code"
-vapi wallet caps agent-claude --per-day 5
-vapi unlock --wallet agent-claude
+vapi accounts add agent-claude --label "claude code"
+vapi accounts caps agent-claude --per-day 5
 ```
 
 ```json
@@ -41,7 +40,7 @@ vapi unlock --wallet agent-claude
   "mcpServers": {
     "vapi": {
       "command": "npx",
-      "args": ["-y", "vapi-network@latest", "mcp", "--wallet", "agent-claude"],
+      "args": ["-y", "vapi-network@latest", "mcp", "--account", "agent-claude"],
       "env": {
         "VAPI_WALLET": "agent-claude",
         "VAPI_NO_SECRETS": "1"
@@ -57,7 +56,19 @@ tools can select any account in the same vault with `wallet.use` or an explicit
 `wallet` argument. Use a separate `VAPI_HOME` containing only the capped account
 when the agent must not access other local accounts.
 
+### Interactive results in Claude Desktop
+
+`call.search` and `call.inspect`, including their deprecated aliases, retain
+interactive MCP Apps results in Claude Desktop. Tool titles and annotations,
+server identity and icons, and the `ui://vapi/call-search.html` and
+`ui://vapi/call-inspect.html` resources describe the presentation. Successful
+structured results include `_view` with a creation time and sequence number
+alongside their `hints` and registry metadata. If the hosted views cannot load,
+the tools still return text. See [interactive results](../packages/mcp/README.md#interactive-results-in-claude-desktop).
+
 ### Tools
+
+The `tasks.*` tools require a preview server with Tasks enabled. Tasks is coming soon on production.
 
 | Tool                      | Input                                                                                                                                                                   | Result                                                                                                                                                                                                                                                                                                                                                                |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -75,9 +86,9 @@ when the agent must not access other local accounts.
 | `router.usage`            | `wallet`                                                                                                                                                                | Router usage plus the linked owner's stake and stake-funded Compute                                                                                                                                                                                                                                                                                                   |
 | `router.chat`             | `model`, `messages[]`, `max_tokens`, `wallet`                                                                                                                           | Completion `content`, resolved `model`, and token `usage`; the Router key stays in the OS secret store and is never returned                                                                                                                                                                                                                                          |
 | `router.buy`              | `usd` (`1`, `5`, `20`, or `50`), `wallet`                                                                                                                               | Receipt summary and the new vAPI Router balance; the Router key stays in the OS secret store and is never returned                                                                                                                                                                                                                                                    |
-| `call.search`             | `query`, `kinds[]`, `network`, `limit`, `cursor`, `includeUnverified`                                                                                                   | One discovery page: `items` with `group`, `fee` and `verification`, plus `nextCursor`, `unavailableKinds`, `rankingVersion`                                                                                                                                                                                                                                           |
-| `call.inspect`            | `id`, `endpoint`                                                                                                                                                        | A listing's `verification`, `fee`, `liveness`, `conformance`, identity, request contract and live quote                                                                                                                                                                                                                                                               |
-| `call.pay`                | `wallet`, `id` or `url`, `method`, `endpoint`, `body`, `contentType`, `network`, `expectedPayTo`, `maxPriceUsd`, `timeoutSeconds`                                       | `wallet`, `status`, `body`, `payment`, `verification` for a registry listing, and `expectedRequest` when a 402 named one                                                                                                                                                                                                                                              |
+| `call.search`             | `query`, `kinds[]`, `network`, `limit`, `cursor`, `includeUnverified`, `includeOutage`                                                                                  | One discovery page with health, alternatives and `hints`, plus `nextCursor`, `unavailableKinds`, `rankingVersion`                                                                                                                                                                                                                                                     |
+| `call.inspect`            | `id`, `endpoint`                                                                                                                                                        | Verification, health, `requestSchema`, `responseSchema`, `exampleRequest`, the registry's last observed quote and `hints`                                                                                                                                                                                                                                             |
+| `call.pay`                | `wallet`, `id` or `url`, `method`, `endpoint`, `body`, `contentType`, `network`, `expectedPayTo`, `maxPriceUsd`, `timeoutSeconds`                                       | `wallet`, `status`, `body`, `payment`, optional `verification` and `expectedRequest`, and `hints`                                                                                                                                                                                                                                                                     |
 | `call.read`               | `url`                                                                                                                                                                   | Agent-run-only GET result: `status`, `contentType`, `body`; restricted to paid HTTPS origins, never pays, and redacts its SIWX proof                                                                                                                                                                                                                                  |
 | `tasks.search`            | `open`, `minUsd`, `tab` (`trending`, `new`, `closing`, `paid`), `limit`                                                                                                 | Public board `cards` and `pinned`, filtered by open state and minimum USD; does not move money                                                                                                                                                                                                                                                                        |
 | `tasks.show`              | `id`, `wallet`                                                                                                                                                          | Signed-in task order with `receipts`, or public `task` card with any `receiptUrl`; does not move money                                                                                                                                                                                                                                                                |
@@ -106,6 +117,13 @@ when the agent must not access other local accounts.
 | `receipts.list`           | `wallet`, `allWallets`, `limit`                                                                                                                                         | `wallet`, `receipts[]`                                                                                                                                                                                                                                                                                                                                                |
 | `receipts.stats`          | `wallet`, `allWallets`, `range`                                                                                                                                         | `wallet`, `range`, `generatedAt`, `totals`, `outcomes`, `latency`, `topServices`, `search`                                                                                                                                                                                                                                                                            |
 | `support.report`          | `message`, `includeAddresses`, `send`                                                                                                                                   | `path`, `issueUrl`, the report itself, and `responseCode` when sent                                                                                                                                                                                                                                                                                                   |
+| `swarm.setup`             | `name`, `agents`, `roles`, `strategy`, `targetsUsd`, `caps`, `treasuryCaps`, `network`, `model`, `fundUsd`, `from`                                                      | Creates or resumes a local swarm; returns `swarm`, `members`, owner approval steps in `next`, optional `fund`, and `message`                                                                                                                                                                                                                                          |
+| `swarm.add`               | `name`, `role`, `targetUsd`, `weight`                                                                                                                                   | Adds or resumes a member; returns swarm setup status and next steps                                                                                                                                                                                                                                                                                                   |
+| `swarm.leave`             | `name`, `member`                                                                                                                                                        | Sweeps a member to the treasury and removes membership; returns `status`, `member`, optional `movement`, and `message`                                                                                                                                                                                                                                                |
+| `swarm.fund`              | `name`, `amountUsd`, `from`                                                                                                                                             | Funds from a linked local account, or returns owner funding instructions when `from` is omitted                                                                                                                                                                                                                                                                       |
+| `swarm.rebalance`         | `name`, `targetsUsd`                                                                                                                                                    | Rebalances under local caps; returns `status`, optional `movement`, `blocked`, `skipped`, and `message`                                                                                                                                                                                                                                                               |
+| `swarm.status`            | `name`                                                                                                                                                                  | Treasury and member balances, links, allocation totals and `openMovements`; moves no funds                                                                                                                                                                                                                                                                            |
+| `swarm.dissolve`          | `name`                                                                                                                                                                  | Sweeps members to the treasury and the treasury to the owner; returns `status`, `movements`, and `message`                                                                                                                                                                                                                                                            |
 | `swarm.run`               | `name`, `task`, `mode` (`lead` or `each`), `lead`, `budgetUsd`, `drawUsd`, `detach`                                                                                     | Attached result, or `detached: true`, `runId`, `mode`, `kind`, `runs[]`, `skipped[]`                                                                                                                                                                                                                                                                                  |
 | `swarm.allocate`          | `amountUsd`, `reason`, `requestId?`                                                                                                                                     | Agent-only; direct MCP calls return an error and move no funds                                                                                                                                                                                                                                                                                                        |
 | `swarm.delegate`          | `member`, `task`, `budgetUsd`, `requestId?`                                                                                                                             | Agent-only; direct MCP calls return an error and start no member run                                                                                                                                                                                                                                                                                                  |
@@ -181,11 +199,27 @@ vapi accounts caps <name> --ceiling off
 
 `call.search` returns vAPI-verified listings plus mirrored external catalogs;
 `includeUnverified: true` adds unverified self-listed APIs, which passed vAPI's
-automated x402 probe but were not reviewed. Every result of `call.search`,
-`call.inspect` and `call.pay` carries `verification`, one of `"none"`,
-`"requested"` or `"verified"`, and a mirrored external row is always `"none"`.
+automated x402 probe but were not reviewed. Registry results from `call.search` and `call.inspect`, plus `call.pay` results
+resolved from a listing, carry `verification`: `"none"`, `"requested"` or
+`"verified"`. A mirrored external row is always `"none"`; payments to an explicit
+URL may omit verification.
 Prefer a verified listing, and read the request contract and the price with
 `call.inspect` before paying one that is not.
+
+The hosted registry hides listings whose health state is `outage` unless
+`call.search` receives `includeOutage: true`. Health contains `state`
+(`healthy`, `degraded`, `outage` or `unknown`), `uptime7d`, `latencyP50Ms`,
+`latencyP95Ms` and `checks7d`. Alternatives contain `ref` and `reason`, either
+`cheaper` or `healthier`. Results from `call.search`, `call.inspect` and
+`call.pay` contain a `hints` string array with zero to four suggested next actions.
+
+A spend-cap block from `call.pay` returns `isError: true`. Its text content is
+JSON with `error` containing the message, `code: "spend_cap_exceeded"`, `cap`,
+`amountUsd`, `limitUsd`, optional `spentUsd` and `wallet`, `command`, and
+`retryable: false`. Amounts are decimal USD strings. Do not retry the payment
+without changing the blocking limit. For account caps, `command` is the terminal command to run.
+For maximum price and run-budget caps, it is the `--max` or `--budget` flag to
+apply to the relevant command. The internal maximum-amount cap returns null.
 
 ### MCP registry
 
@@ -198,8 +232,7 @@ vault must be unlocked or supplied with `VAPI_VAULT_PASSWORD` before startup.
 Keep `server.json`'s version and its npm package version aligned with every
 package release. The source and staged `vapi-network/package.json` must retain
 `mcpName` equal to `server.json`'s name. `pnpm pack:check` checks these values.
-Already published npm versions cannot gain this marker, so release a new
-version with it before submitting registry metadata.
+Published npm versions cannot gain this marker retroactively; verify it on the version being submitted.
 
 After merging and publishing the staged npm packages through the normal release
 process, a GitHub organization Owner runs these commands from the repo root:
@@ -212,31 +245,43 @@ mcp-publisher publish server.json
 
 The [official registry quickstart](https://github.com/modelcontextprotocol/registry/blob/main/docs/modelcontextprotocol-io/quickstart.mdx)
 and [authentication guide](https://github.com/modelcontextprotocol/registry/blob/main/docs/modelcontextprotocol-io/authentication.mdx)
-cover package verification and organization access. The metadata lists only
-local stdio; hosted MCP needs separate production transport and auth validation.
+cover package verification and organization access. The metadata lists the local stdio server. Hosted MCP is a separate production service.
 
 ### Install into a client
 
-Use this command to write or update a client's vAPI server entry:
+Use this command to register vAPI with a client:
 
 ```text
-vapi mcp install <claude|cursor|codex> [--home <dir>] [--registry <url>] [--json]
+vapi mcp install <claude-code|claude-desktop|cursor|codex> [--home <dir>] [--registry <url>] [--no-link] [--json]
 ```
 
 `--home` sets the vAPI home written into the entry's `VAPI_HOME`; it defaults
 to `~/.vapi` and does not change the client configuration path. `--registry`
 sets the registry URL written into `VAPI_REGISTRY_URL`.
 
+For Claude Code, run:
+
+```bash
+vapi mcp install claude-code
+```
+
+Install Claude Code first so its `claude` command is on PATH. This runs
+`claude mcp add --scope user` to register the same vAPI server entry for your
+user account. Start a new Claude Code session, then ask: "Search vAPI for a
+weather API."
+
 For Claude Desktop, run:
 
 ```bash
-vapi mcp install claude
+vapi mcp install claude-desktop
 ```
 
 On macOS, this writes `~/Library/Application Support/Claude/claude_desktop_config.json`.
 On Windows, it writes `%APPDATA%\Claude\claude_desktop_config.json`. On Linux,
 it writes `~/.config/Claude/claude_desktop_config.json`. The next step is:
 Restart Claude Desktop, then ask it: "Search vAPI for a weather API."
+The `claude` target remains an alias for `claude-desktop` and prints a note
+naming `claude-code`.
 
 For Cursor, run:
 
@@ -297,6 +342,6 @@ removed in a later release.
 
 #### What the MCP server cannot do
 
-Create, rename, remove, restore, back up, import or export an account, or return a
-recovery phrase, a private key or a passphrase. Those stay in the CLI, in front
-of a person.
+Rename, remove, restore, back up, import or export an account, or return a
+recovery phrase, private key or passphrase. Those operations stay in the CLI.
+`accounts.add` and swarm setup can derive accounts without exposing keys.

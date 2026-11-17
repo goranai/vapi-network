@@ -6,6 +6,7 @@ import {
   MovementError,
   ONRAMP_NETWORK,
   STATS_RANGES,
+  SpendCapExceededError,
   SwarmError,
   TransferError,
   VAPI_CLIENT_VERSION,
@@ -128,7 +129,15 @@ import {
 import { createSiblingsTool, vapiSiblingsTool } from "./tools/siblings.js";
 import { getWallet, type WalletBalance } from "./tools/wallet.js";
 import { createDocsTools, docsReadTool, docsSearchTool } from "./tools/docs.js";
+import { SERVER_ICONS, withPresentation, type ToolPresentation } from "./tool-presentation.js";
 import { WalletSession, type SessionWalletInfo } from "./wallet-session.js";
+import {
+  MCP_APP_VIEWS,
+  VIEW_RESOURCE_META,
+  createViewLoader,
+  type ViewLoader,
+  type ViewName,
+} from "./views.js";
 
 export { callService, type CallToolInput, type CallToolResult };
 
@@ -328,6 +337,8 @@ type ToolResult = {
 };
 
 type ToolDefinition<Shape extends z.ZodRawShape> = {
+  title?: string;
+  annotations?: ToolPresentation["annotations"];
   description?: string;
   deprecatedReplacement?: string;
   inputSchema: Shape;
@@ -336,6 +347,8 @@ type ToolDefinition<Shape extends z.ZodRawShape> = {
 };
 
 type StoredTool = {
+  title: string;
+  annotations: ToolPresentation["annotations"];
   description?: string;
   deprecatedReplacement?: string;
   inputSchema: z.ZodObject<z.ZodRawShape>;
@@ -345,9 +358,12 @@ type StoredTool = {
 
 type ListedTool = {
   name: string;
+  title: string;
+  annotations: ToolPresentation["annotations"];
   description?: string;
   inputSchema: unknown;
   outputSchema?: unknown;
+  _meta?: { ui: { resourceUri: string }; "ui/resourceUri": string };
 };
 
 /** Minimal MCP server implementation for stdio and deterministic in-memory tests. */
@@ -362,13 +378,52 @@ function objectOutputSchema(schema: z.ZodType | undefined): { outputSchema?: unk
   return json.type === "object" ? { outputSchema: json } : {};
 }
 
+function appViewForTool(name: string) {
+  return Object.hasOwn(MCP_APP_VIEWS, name)
+    ? MCP_APP_VIEWS[name as keyof typeof MCP_APP_VIEWS]
+    : undefined;
+}
+
+function appViewResource({ view, uri }: { view: ViewName; uri: string }, origin: string) {
+  return {
+    uri,
+    name: `vapi-${view}`,
+    ...VIEW_RESOURCE_META[view],
+    mimeType: "text/html;profile=mcp-app",
+    _meta: {
+      ui: {
+        csp: {
+          connectDomains: [origin],
+          resourceDomains: ["https://assets.claude.ai", origin],
+        },
+        prefersBorder: view === "call-inspect",
+      },
+    },
+  };
+}
+
 export class VapiMcpServer {
   readonly #tools = new Map<string, StoredTool>();
   readonly #onClose: (() => void) | undefined;
   #stdio: Interface | undefined;
+  #views: ViewLoader | undefined;
+  #viewSequence = 0;
 
   constructor(onClose?: () => void) {
     this.#onClose = onClose;
+  }
+
+  useViews(loader: ViewLoader): void {
+    this.#views = loader;
+  }
+
+  #resources() {
+    const loader = this.#views;
+    return loader
+      ? [MCP_APP_VIEWS["call.search"], MCP_APP_VIEWS["call.inspect"]].map((view) =>
+          appViewResource(view, loader.origin),
+        )
+      : [];
   }
 
   registerTool<Shape extends z.ZodRawShape>(
@@ -376,10 +431,16 @@ export class VapiMcpServer {
     definition: ToolDefinition<Shape>,
     handler: (input: z.infer<z.ZodObject<Shape>>) => Promise<ToolResult>,
   ): void {
+    const presentation =
+      definition.title !== undefined && definition.annotations !== undefined
+        ? { title: definition.title, annotations: definition.annotations }
+        : withPresentation({ name, ...definition });
     const inputSchema = definition.strictInput
       ? z.strictObject(definition.inputSchema)
       : z.object(definition.inputSchema);
     this.#tools.set(name, {
+      title: presentation.title,
+      annotations: presentation.annotations,
       ...(definition.description ? { description: definition.description } : {}),
       ...(definition.deprecatedReplacement
         ? { deprecatedReplacement: definition.deprecatedReplacement }
@@ -392,12 +453,21 @@ export class VapiMcpServer {
 
   async listTools(): Promise<{ tools: ListedTool[] }> {
     return {
-      tools: [...this.#tools].map(([name, tool]) => ({
-        name,
-        ...(tool.description ? { description: tool.description } : {}),
-        inputSchema: z.toJSONSchema(tool.inputSchema),
-        ...objectOutputSchema(tool.outputSchema),
-      })),
+      tools: [...this.#tools].map(([name, tool]) => {
+        const view = appViewForTool(name);
+        const uri = view && this.#views?.get(view.view) !== undefined ? view.uri : undefined;
+        return {
+          name,
+          title: tool.title,
+          annotations: tool.annotations,
+          ...(tool.description ? { description: tool.description } : {}),
+          inputSchema: z.toJSONSchema(tool.inputSchema),
+          ...objectOutputSchema(tool.outputSchema),
+          ...(uri === undefined
+            ? {}
+            : { _meta: { ui: { resourceUri: uri }, "ui/resourceUri": uri } }),
+        };
+      }),
     };
   }
 
@@ -413,7 +483,16 @@ export class VapiMcpServer {
       };
     }
     try {
-      const result = await tool.handler(request.arguments ?? {});
+      let result = await tool.handler(request.arguments ?? {});
+      if (!result.isError && appViewForTool(request.name)) {
+        result = {
+          ...result,
+          structuredContent: {
+            ...result.structuredContent,
+            _view: { createdAt: Date.now(), seq: ++this.#viewSequence },
+          },
+        };
+      }
       return tool.deprecatedReplacement
         ? withDeprecation(result, tool.deprecatedReplacement)
         : result;
@@ -425,9 +504,16 @@ export class VapiMcpServer {
     }
   }
 
-  connectStdio(): void {
+  #output: { write(chunk: string): unknown } = process.stdout;
+
+  /**
+   * Serves JSON-RPC lines from `input` and answers on `output`. The desktop
+   * app hands in a socket; the CLI hands in stdio through connectStdio().
+   */
+  connect(input: NodeJS.ReadableStream, output: { write(chunk: string): unknown }): void {
     if (this.#stdio) return;
-    this.#stdio = createInterface({ input: process.stdin, crlfDelay: Infinity });
+    this.#output = output;
+    this.#stdio = createInterface({ input, crlfDelay: Infinity });
     this.#stdio.on("line", (line) => {
       void this.#handleLine(line);
     });
@@ -435,6 +521,10 @@ export class VapiMcpServer {
       this.#stdio = undefined;
       this.#onClose?.();
     });
+  }
+
+  connectStdio(): void {
+    this.connect(process.stdin, process.stdout);
   }
 
   async close(): Promise<void> {
@@ -452,18 +542,54 @@ export class VapiMcpServer {
       this.#write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
       return;
     }
+    const response = await this.handleRequest(request);
+    if (response !== undefined) this.#write(response);
+  }
+
+  async handleRequest(request: Record<string, unknown>): Promise<
+    | {
+        jsonrpc: "2.0";
+        id: unknown;
+        result?: unknown;
+        error?: { code: number; message: string };
+      }
+    | undefined
+  > {
     const id = request.id;
     const method = request.method;
     if (typeof method !== "string" || id === undefined) return;
     try {
       let result: unknown;
       if (method === "initialize") {
+        await this.#views?.warm();
         const params = asRecord(request.params);
         result = {
           protocolVersion:
             typeof params?.protocolVersion === "string" ? params.protocolVersion : "2025-11-25",
-          capabilities: { tools: {} },
-          serverInfo: { name: "@vapi-network/mcp", version: VAPI_CLIENT_VERSION },
+          capabilities: { tools: {}, ...(this.#views ? { resources: {} } : {}) },
+          serverInfo: {
+            name: "@vapi-network/mcp",
+            title: "vAPI Network",
+            version: VAPI_CLIENT_VERSION,
+            websiteUrl: "https://vapinetwork.ai",
+            icons: SERVER_ICONS,
+          },
+        };
+      } else if (method === "resources/list") {
+        result = { resources: this.#resources() };
+      } else if (method === "resources/read") {
+        const params = asRecord(request.params);
+        const view = Object.values(MCP_APP_VIEWS).find((view) => view.uri === params?.uri);
+        if (!this.#views || !view) {
+          return { jsonrpc: "2.0", id, error: { code: -32002, message: "resource not found" } };
+        }
+        const html = await this.#views.load(view.view);
+        if (html === undefined) throw new Error(`view ${view.view} is unavailable`);
+        const resource = appViewResource(view, this.#views.origin);
+        result = {
+          contents: [
+            { uri: resource.uri, mimeType: resource.mimeType, text: html, _meta: resource._meta },
+          ],
         };
       } else if (method === "tools/list") {
         result = await this.listTools();
@@ -476,25 +602,24 @@ export class VapiMcpServer {
       } else if (method === "ping") {
         result = {};
       } else {
-        this.#write({
+        return {
           jsonrpc: "2.0",
           id,
           error: { code: -32601, message: `Method not found: ${method}` },
-        });
-        return;
+        };
       }
-      this.#write({ jsonrpc: "2.0", id, result });
+      return { jsonrpc: "2.0", id, result };
     } catch (error) {
-      this.#write({
+      return {
         jsonrpc: "2.0",
         id,
         error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
-      });
+      };
     }
   }
 
   #write(message: unknown): void {
-    process.stdout.write(`${JSON.stringify(message)}\n`);
+    this.#output.write(`${JSON.stringify(message)}\n`);
   }
 }
 
@@ -527,6 +652,7 @@ export function createVapiServer(options: VapiServerOptions = {}) {
     options.fetchImpl ??
     createPublicFetch({ allowPrivateNetwork: config.allowPrivateNetwork ?? false });
   const apiBase = options.agentLink?.apiBase ?? agentApiBase(config, options.env);
+  server.useViews(createViewLoader({ registryUrl: apiBase, fetchImpl: guardedFetch }));
   const auth = createAuthTools({
     session,
     secrets,
@@ -961,7 +1087,12 @@ export function createVapiServer(options: VapiServerOptions = {}) {
     const tool = {
       description: action.description,
       inputSchema: action.input.shape,
-      outputSchema: action.output,
+      outputSchema:
+        appViewForTool(action.name) && action.output instanceof z.ZodObject
+          ? action.output.extend({
+              _view: z.object({ createdAt: z.number(), seq: z.number().int() }).optional(),
+            })
+          : action.output,
     };
     const handler = async (input: unknown) =>
       asStructuredToolResult(() => runAction(registeredAction, input, actionContext));
@@ -1441,37 +1572,73 @@ export async function loadServerConfig() {
 }
 
 export function toolError(error: unknown) {
+  const spendCapError = serializeSpendCapError(error);
   const text =
-    error instanceof VapiCallError
-      ? JSON.stringify(
-          {
-            error: error.message,
-            code: error.code,
-            ...(error.possibleSettlement
-              ? {
-                  possibleSettlement: Object.fromEntries(
-                    Object.entries(error.possibleSettlement).filter(
-                      ([key]) => key !== "authorizationTransaction",
+    spendCapError !== undefined
+      ? JSON.stringify(spendCapError, null, 2)
+      : error instanceof VapiCallError
+        ? JSON.stringify(
+            {
+              error: error.message,
+              code: error.code,
+              ...(error.possibleSettlement
+                ? {
+                    possibleSettlement: Object.fromEntries(
+                      Object.entries(error.possibleSettlement).filter(
+                        ([key]) => key !== "authorizationTransaction",
+                      ),
                     ),
-                  ),
-                }
-              : {}),
-            ...(error.paymentRejection ? { paymentRejection: error.paymentRejection } : {}),
-            ...(error.confirmedSettlement
-              ? { confirmedSettlement: error.confirmedSettlement }
-              : {}),
-          },
-          null,
-          2,
-        )
-      : error instanceof DocsError
-        ? JSON.stringify({ error: error.message, code: error.code }, null, 2)
-        : error instanceof Error
-          ? error.message
-          : String(error);
+                  }
+                : {}),
+              ...(error.paymentRejection ? { paymentRejection: error.paymentRejection } : {}),
+              ...(error.confirmedSettlement
+                ? { confirmedSettlement: error.confirmedSettlement }
+                : {}),
+            },
+            null,
+            2,
+          )
+        : error instanceof DocsError
+          ? JSON.stringify({ error: error.message, code: error.code }, null, 2)
+          : error instanceof Error
+            ? error.message
+            : String(error);
   return {
     isError: true as const,
     content: [{ type: "text" as const, text }],
+  };
+}
+
+function serializeSpendCapError(error: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(error);
+  if (
+    !(error instanceof SpendCapExceededError) &&
+    (record === undefined || record.code !== "spend_cap_exceeded")
+  ) {
+    return undefined;
+  }
+  const value = error as SpendCapExceededError;
+  if (typeof value.amountUsd !== "string" || typeof value.limitUsd !== "string") return undefined;
+  if (
+    value.cap !== "per_call" &&
+    value.cap !== "per_day" &&
+    value.cap !== "max_price" &&
+    value.cap !== "max_amount" &&
+    value.cap !== "run_budget"
+  ) {
+    return undefined;
+  }
+  const message = typeof value.message === "string" ? value.message : "A spend cap was exceeded.";
+  return {
+    error: message,
+    code: "spend_cap_exceeded",
+    cap: value.cap,
+    amountUsd: value.amountUsd,
+    limitUsd: value.limitUsd,
+    ...(typeof value.spentUsd === "string" ? { spentUsd: value.spentUsd } : {}),
+    ...(typeof value.wallet === "string" ? { wallet: value.wallet } : {}),
+    command: typeof value.command === "string" ? value.command : null,
+    retryable: false,
   };
 }
 

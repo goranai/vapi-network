@@ -3,11 +3,13 @@ import { TaskOperationError } from "./operation-support.js";
 
 export type TasksV2Deployment = {
   escrowFactoryV2: Address;
+  disputeResolverV3: Address;
   bountyPoolFactoryV1: Address;
   usdc: Address;
   usdcName: string;
   usdcVersion: string;
   offerTtlSeconds?: number;
+  evidenceWindowSeconds?: number;
   choiceWindowSeconds?: number;
 };
 export type TasksV2DeploymentOverrides = Partial<Record<number, TasksV2Deployment>>;
@@ -25,10 +27,18 @@ export function getTrustedTasksV2Deployment(
   } = {},
 ): TasksV2Deployment {
   const env = options.env ?? process.env;
-  const names = ["ESCROW_FACTORY", "POOL_FACTORY", "USDC", "USDC_NAME", "USDC_VERSION"] as const;
+  const names = [
+    "ESCROW_FACTORY",
+    "POOL_FACTORY",
+    "USDC",
+    "USDC_NAME",
+    "USDC_VERSION",
+    "DISPUTE_RESOLVER_V3",
+  ] as const;
   const values = names.map((name) => env[`VAPI_TASKS_V2_${name}_${chainId}`]);
   const anyEnv =
     values.some((v) => v !== undefined) ||
+    env[`VAPI_TASKS_V2_EVIDENCE_WINDOW_SECONDS_${chainId}`] !== undefined ||
     env[`VAPI_TASKS_V2_OFFER_TTL_SECONDS_${chainId}`] !== undefined ||
     env[`VAPI_TASKS_V2_CHOICE_WINDOW_SECONDS_${chainId}`] !== undefined;
   let configured = options.overrides?.[chainId];
@@ -36,7 +46,7 @@ export function getTrustedTasksV2Deployment(
     if (values.some((v) => !v?.trim()))
       throw new TaskOperationError(
         "v2_trust_unavailable",
-        "A V2 override requires both factories, USDC, its domain name and version for the same chain.",
+        "A V2 override requires both factories, the dispute resolver, USDC, its domain name and version for the same chain.",
       );
     configured = {
       escrowFactoryV2: values[0]! as Address,
@@ -44,6 +54,10 @@ export function getTrustedTasksV2Deployment(
       usdc: values[2]! as Address,
       usdcName: values[3]!,
       usdcVersion: values[4]!,
+      disputeResolverV3: values[5]! as Address,
+      ...(env[`VAPI_TASKS_V2_EVIDENCE_WINDOW_SECONDS_${chainId}`] !== undefined
+        ? { evidenceWindowSeconds: Number(env[`VAPI_TASKS_V2_EVIDENCE_WINDOW_SECONDS_${chainId}`]) }
+        : {}),
       ...(env[`VAPI_TASKS_V2_OFFER_TTL_SECONDS_${chainId}`] !== undefined
         ? { offerTtlSeconds: Number(env[`VAPI_TASKS_V2_OFFER_TTL_SECONDS_${chainId}`]) }
         : {}),
@@ -58,17 +72,29 @@ export function getTrustedTasksV2Deployment(
       "v2_trust_unavailable",
       `No locally pinned V2 deployment for chain ${chainId}. Configure an explicit VAPI_TASKS_V2_*_${chainId} staging override or wait for the verified deployment pins.`,
     );
-  const normalized = {
-    ...tuple,
-    escrowFactoryV2: getAddress(tuple.escrowFactoryV2),
-    bountyPoolFactoryV1: getAddress(tuple.bountyPoolFactoryV1),
-    usdc: getAddress(tuple.usdc),
-  };
+  let normalized: TasksV2Deployment;
+  try {
+    normalized = {
+      ...tuple,
+      escrowFactoryV2: getAddress(tuple.escrowFactoryV2),
+      disputeResolverV3: getAddress(tuple.disputeResolverV3),
+      bountyPoolFactoryV1: getAddress(tuple.bountyPoolFactoryV1),
+      usdc: getAddress(tuple.usdc),
+    };
+  } catch {
+    throw new TaskOperationError(
+      "v2_trust_unavailable",
+      "The local V2 deployment override contains an invalid address.",
+    );
+  }
   if (
-    [normalized.escrowFactoryV2, normalized.bountyPoolFactoryV1, normalized.usdc].includes(
-      zeroAddress,
-    ) ||
-    [tuple.offerTtlSeconds, tuple.choiceWindowSeconds].some(
+    [
+      normalized.escrowFactoryV2,
+      normalized.bountyPoolFactoryV1,
+      normalized.disputeResolverV3,
+      normalized.usdc,
+    ].includes(zeroAddress) ||
+    [tuple.offerTtlSeconds, tuple.choiceWindowSeconds, tuple.evidenceWindowSeconds].some(
       (value) => value !== undefined && (!Number.isSafeInteger(value) || value <= 0),
     ) ||
     !tuple.usdcName ||
@@ -80,7 +106,7 @@ export function getTrustedTasksV2Deployment(
     );
   if (configured)
     (options.notice ?? console.error)(
-      `Tasks V2 untrusted override for chain ${chainId}: escrow factory ${normalized.escrowFactoryV2}, pool factory ${normalized.bountyPoolFactoryV1}, USDC ${normalized.usdc}.`,
+      `Tasks V2 untrusted override for chain ${chainId}: escrow factory ${normalized.escrowFactoryV2}, pool factory ${normalized.bountyPoolFactoryV1}, dispute resolver ${normalized.disputeResolverV3}, USDC ${normalized.usdc}.`,
     );
   return normalized;
 }

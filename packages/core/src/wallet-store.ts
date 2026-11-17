@@ -247,7 +247,7 @@ export class WalletStore {
     registry: WalletRegistry,
   ) {
     this.registry = registry;
-    this.secrets = options.secrets ?? secretStore();
+    this.secrets = options.secrets ?? secretStore({ home });
     this.environment = options.env ?? process.env;
     this.passphraseResolver =
       options.resolvePassphrase ?? defaultPassphraseResolver(this.environment, this.secrets);
@@ -424,6 +424,18 @@ export class WalletStore {
       (candidate) => candidate.name === target,
     );
     return account?.address ?? (await readKeystoreSummary(this.pathFor(target))).address;
+  }
+
+  /**
+   * Creates the vault without deriving an account, for apps that create every
+   * account by name. Refuses when a vault already exists in this home.
+   */
+  async createEmptyVault(): Promise<void> {
+    if ((await this.readVaultUnlocked()) !== undefined) {
+      throw new KeystoreError("A vault already exists in this home.");
+    }
+    await this.openVault({ create: true });
+    this.dropVaultCache();
   }
 
   /**

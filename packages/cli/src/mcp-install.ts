@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir as systemHomedir } from "node:os";
 import { dirname, posix, win32 } from "node:path";
@@ -16,9 +17,23 @@ import {
   type CliIo,
 } from "./cli.js";
 
+import { escapeToml, removeTomlTables, tomlSeparator } from "./toml-config.js";
+
 import { offerDashboardLink } from "./dashboard.js";
 
-type McpInstallApp = "claude" | "cursor" | "codex";
+type McpInstallApp = "claude-code" | "claude-desktop" | "cursor" | "codex";
+type McpFileInstallApp = Exclude<McpInstallApp, "claude-code">;
+
+export type McpInstallProcessResult = {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+};
+
+export type McpInstallProcessRunner = (
+  command: string,
+  args: readonly string[],
+) => Promise<McpInstallProcessResult>;
 
 type McpServerEntry = {
   command: "npx";
@@ -30,16 +45,21 @@ type McpServerEntry = {
 };
 
 const MCP_INSTALL_USAGE =
-  "Usage: vapi mcp install <claude|cursor|codex> [--home <dir>] [--registry <url>] [--no-link] [--json]";
-const APPS = new Set<McpInstallApp>(["claude", "cursor", "codex"]);
+  "Usage: vapi mcp install <claude-code|claude-desktop|cursor|codex> [--home <dir>] [--registry <url>] [--no-link] [--json]";
+const APPS = new Set<McpInstallApp>(["claude-code", "claude-desktop", "cursor", "codex"]);
+const CLAUDE_ALIAS_NOTICE =
+  "vapi mcp install claude installs into Claude Desktop; for the Claude Code CLI use: vapi mcp install claude-code";
+const CLAUDE_NOT_FOUND =
+  "Claude Code's claude command was not found on PATH. Install Claude Code, or run this yourself:";
 const NEXT_STEP: Record<McpInstallApp, string> = {
-  claude: 'Restart Claude Desktop, then ask it: "Search vAPI for a weather API."',
+  "claude-code": 'Start a new Claude Code session, then ask: "Search vAPI for a weather API."',
+  "claude-desktop": 'Restart Claude Desktop, then ask it: "Search vAPI for a weather API."',
   cursor: 'Reload Cursor, then ask its agent: "Search vAPI for a weather API."',
   codex: 'Start codex in a new terminal, then ask: "Search vAPI for a weather API."',
 };
 
 export function mcpInstallTarget(
-  app: McpInstallApp,
+  app: McpFileInstallApp,
   context: {
     platform: NodeJS.Platform;
     homedir: string;
@@ -83,19 +103,21 @@ export async function mcpInstallCommand(
   json: boolean,
   io: CliIo,
   dependencies: CliDependencies,
-): Promise<void> {
+): Promise<number> {
   const parsed = parseArguments(argv, {
     valueOptions: new Set(["--home", "--registry"]),
     booleanOptions: new Set(["--no-link"]),
     maximumPositionals: 1,
   });
-  const appValue = parsed.positionals[0];
-  if (appValue === undefined) throw new UsageError(MCP_INSTALL_USAGE);
+  const requestedApp = parsed.positionals[0];
+  if (requestedApp === undefined) throw new UsageError(MCP_INSTALL_USAGE);
+  const appValue = requestedApp === "claude" ? "claude-desktop" : requestedApp;
   if (!isMcpInstallApp(appValue)) {
     throw new UsageError(
-      `Unknown app ${JSON.stringify(appValue)}. Choose claude, cursor or codex.\n${MCP_INSTALL_USAGE}`,
+      `Unknown app ${JSON.stringify(requestedApp)}. Choose claude-code, claude-desktop, cursor or codex.\n${MCP_INSTALL_USAGE}`,
     );
   }
+  if (requestedApp === "claude") io.stderr(CLAUDE_ALIAS_NOTICE);
 
   const home = parsed.one("--home") ?? getVapiPaths().directory;
   const paths = getVapiPaths(home);
@@ -104,27 +126,35 @@ export async function mcpInstallCommand(
     ((await pathExists(paths.config))
       ? registryBaseUrl(await readConfig(paths.config, io))
       : resolveRegistryUrl());
+  const offerLink = async () => {
+    const name = await unlinkedDefaultAccount(home, dependencies);
+    return name === undefined
+      ? {}
+      : await offerDashboardLink({
+          name,
+          json,
+          noLink: parsed.has("--no-link"),
+          io,
+          dependencies,
+          home,
+          apiBase: parsed.one("--registry"),
+        });
+  };
+  const platform = dependencies.mcpInstall?.platform ?? process.platform;
+  const entry = serverEntry(home, registry);
+  if (appValue === "claude-code") {
+    return await installClaudeCode(entry, platform, json, io, dependencies, offerLink);
+  }
+
   const target = mcpInstallTarget(appValue, {
-    platform: dependencies.mcpInstall?.platform ?? process.platform,
+    platform,
     homedir: dependencies.mcpInstall?.homedir ?? systemHomedir(),
     cwd: dependencies.mcpInstall?.cwd ?? process.cwd(),
     appData: dependencies.mcpInstall?.appData ?? process.env.APPDATA,
   });
-  const entry = serverEntry(home, registry);
   const created = await writeMcpConfig(target, entry);
 
-  const name = await unlinkedDefaultAccount(home, dependencies);
-  const offerLink = (name: string) =>
-    offerDashboardLink({
-      name,
-      json,
-      noLink: parsed.has("--no-link"),
-      io,
-      dependencies,
-      home,
-      apiBase: parsed.one("--registry"),
-    });
-  const link = json && name !== undefined ? await offerLink(name) : {};
+  const link = json ? await offerLink() : {};
   output(
     io,
     json,
@@ -133,8 +163,9 @@ export async function mcpInstallCommand(
   );
   if (!json) {
     io.stdout(NEXT_STEP[appValue]);
-    if (name !== undefined) await offerLink(name);
+    await offerLink();
   }
+  return 0;
 }
 
 async function unlinkedDefaultAccount(
@@ -152,6 +183,167 @@ async function unlinkedDefaultAccount(
     // MCP installation also works before a wallet is available.
   }
   return undefined;
+}
+
+async function installClaudeCode(
+  entry: McpServerEntry,
+  platform: NodeJS.Platform,
+  json: boolean,
+  io: CliIo,
+  dependencies: CliDependencies,
+  offerLink: () => Promise<object>,
+): Promise<number> {
+  const processCommand = platform === "win32" ? "claude.cmd" : "claude";
+  const processArgs = claudeCodeArgs(entry);
+  const command =
+    platform === "win32"
+      ? [escapeCmd(processCommand), ...processArgs.map(escapeCmdArgument)].join(" ")
+      : displayCommand(processCommand, processArgs);
+  let result: McpInstallProcessResult;
+  try {
+    result = await (dependencies.mcpInstall?.runProcess ?? defaultMcpInstallProcess)(
+      processCommand,
+      processArgs,
+    );
+  } catch (error) {
+    if (isErrorCode(error, "ENOENT")) {
+      return claudeCodeFailure(json, io, command, "claude_not_found", CLAUDE_NOT_FOUND);
+    }
+    const message = `Claude Code MCP installation failed: ${errorMessage(error)}`;
+    return claudeCodeFailure(json, io, command, "claude_mcp_add_failed", message);
+  }
+
+  if (result.exitCode !== 0) {
+    const status =
+      result.exitCode === null
+        ? "Claude Code's claude command ended without an exit code."
+        : `Claude Code's claude command exited with code ${result.exitCode}.`;
+    const stderr = result.stderr.trim();
+    const message = stderr.length === 0 ? status : `${status} ${stderr}`;
+    return claudeCodeFailure(json, io, command, "claude_mcp_add_failed", message, result.exitCode);
+  }
+
+  const nextStep = NEXT_STEP["claude-code"];
+  const link = json ? await offerLink() : {};
+  if (json)
+    io.stdout(JSON.stringify({ ...link, app: "claude-code", installed: true, command, nextStep }));
+  else {
+    io.stdout(command);
+    io.stdout(nextStep);
+    await offerLink();
+  }
+  return 0;
+}
+
+function claudeCodeArgs(entry: McpServerEntry): string[] {
+  return [
+    "mcp",
+    "add",
+    "--scope",
+    "user",
+    "vapi",
+    "-e",
+    `VAPI_HOME=${entry.env.VAPI_HOME}`,
+    "-e",
+    `VAPI_REGISTRY_URL=${entry.env.VAPI_REGISTRY_URL}`,
+    "--",
+    entry.command,
+    ...entry.args,
+  ];
+}
+
+function claudeCodeFailure(
+  json: boolean,
+  io: CliIo,
+  command: string,
+  code: "claude_not_found" | "claude_mcp_add_failed",
+  message: string,
+  exitCode?: number | null,
+): 1 {
+  if (json) {
+    io.stdout(
+      JSON.stringify({
+        app: "claude-code",
+        installed: false,
+        command,
+        error: { code, message, ...(exitCode === undefined ? {} : { exitCode }) },
+      }),
+    );
+  } else if (code === "claude_not_found") {
+    io.stderr(`${message}\n${command}`);
+  } else {
+    io.stderr(`${command}\n${message}`);
+  }
+  return 1;
+}
+
+function displayCommand(command: string, args: readonly string[]): string {
+  return [command, ...args].map(shellQuote).join(" ");
+}
+
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/u.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function isErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export const defaultMcpInstallProcess: McpInstallProcessRunner = async (command, args) => {
+  const batch = /\.(?:cmd|bat)$/iu.test(command);
+  const executable = batch ? await windowsBatchPath(command) : command;
+  // A batch shim goes through cmd.exe twice: once here and once in the shim.
+  const commandLine = batch
+    ? [escapeCmd(executable), ...args.map((arg) => escapeCmdArgument(arg))].join(" ")
+    : undefined;
+  return await new Promise((resolve, reject) => {
+    const child = spawn(
+      batch ? "cmd.exe" : command,
+      batch ? ["/d", "/v:off", "/s", "/c", `"${commandLine}"`] : [...args],
+      {
+        shell: false,
+        ...(batch ? { windowsVerbatimArguments: true } : {}),
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 60_000,
+        killSignal: "SIGKILL",
+        windowsHide: true,
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (exitCode) => resolve({ exitCode, stdout, stderr }));
+  });
+};
+
+async function windowsBatchPath(command: string): Promise<string> {
+  const path = Object.entries(process.env).find(([key]) => key.toLowerCase() === "path")?.[1];
+  for (const directory of ["", ...(path ?? "").split(";")]) {
+    const candidate = win32.join(directory.replace(/^"|"$/gu, ""), command);
+    if (await pathExists(candidate)) return candidate;
+  }
+  throw Object.assign(new Error(`${command} was not found on PATH.`), { code: "ENOENT" });
+}
+
+function escapeCmd(value: string): string {
+  return value.replace(/[()[\]%!^"`<>&|;, *?]/gu, "^$&");
+}
+
+function escapeCmdArgument(value: string): string {
+  // Preserve literal quotes and trailing slashes for the program's argv parser,
+  // then protect metacharacters through both command-interpreter passes.
+  const quoted = `"${value.replace(/(\\*)"/gu, '$1$1\\"').replace(/(\\*)$/u, "$1$1")}"`;
+  return escapeCmd(escapeCmd(quoted));
 }
 
 function isMcpInstallApp(value: string): value is McpInstallApp {
@@ -215,7 +407,10 @@ function jsonConfig(path: string, existing: string | undefined, entry: McpServer
 }
 
 function tomlConfig(existing: string, entry: McpServerEntry): string {
-  const retained = removeVapiTomlTables(existing);
+  const retained = removeTomlTables(
+    existing,
+    ([root, name]) => root === "mcp_servers" && name === "vapi",
+  );
   const block = [
     "[mcp_servers.vapi]",
     'command = "npx"',
@@ -224,52 +419,6 @@ function tomlConfig(existing: string, entry: McpServerEntry): string {
     "",
   ].join("\n");
   return `${retained}${tomlSeparator(retained)}${block}`;
-}
-
-function removeVapiTomlTables(contents: string): string {
-  const lines = contents.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-  let removing = false;
-  let retained = "";
-  for (const line of lines) {
-    const table = tomlTableName(line);
-    if (table !== undefined) removing = isVapiTomlTable(table);
-    if (!removing) retained += line;
-  }
-  return retained;
-}
-
-function tomlTableName(line: string): string | undefined {
-  const header = line.replace(/\r?\n$/, "");
-  const match = /^\s*(?:\[\[\s*(.*?)\s*\]\]|\[\s*(.*?)\s*\])\s*(?:#.*)?$/.exec(header);
-  return match?.[1] ?? match?.[2];
-}
-
-function isVapiTomlTable(table: string): boolean {
-  const key = String.raw`(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')`;
-  const match = new RegExp(`^\\s*(${key})\\s*\\.\\s*(${key})(?:\\s*\\.|\\s*$)`).exec(table);
-  if (match === null) return false;
-  return unquoteTomlKey(match[1]!) === "mcp_servers" && unquoteTomlKey(match[2]!) === "vapi";
-}
-
-function unquoteTomlKey(key: string): string {
-  if (key.startsWith("'") && key.endsWith("'")) return key.slice(1, -1);
-  if (key.startsWith('"') && key.endsWith('"')) {
-    try {
-      return JSON.parse(key) as string;
-    } catch {
-      return key;
-    }
-  }
-  return key;
-}
-
-function tomlSeparator(contents: string): string {
-  if (contents.length === 0 || /(?:\r?\n)[ \t]*(?:\r?\n)$/.test(contents)) return "";
-  return /\r?\n$/.test(contents) ? "\n" : "\n\n";
-}
-
-function escapeToml(value: string): string {
-  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

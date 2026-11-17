@@ -1,5 +1,7 @@
 # Task commands
 
+Tasks is an onchain task market with USDC escrow, delivery, review and disputes. The commands below require a server with Tasks enabled.
+
 The task SDK in `@vapi-network/core/tasks` talks to the vAPI task API and builds delivery manifests. The CLI verbs below use its shared actions. The local MCP server exposes the same task verbs.
 
 | Verb                | What it does                                                                 | Moves money            |
@@ -62,13 +64,13 @@ Durations accept `5s`, `10m`, `48h`, `7d`, or an ISO-8601 timestamp. Posting req
 
 Hosted `tasks.confirm` completes signing intents and advances chain operations. It is separate from the local CLI verbs documented above.
 
-Posting a task moves no money. The fee line shows gross · fee · net using the deployed `feeBp`; an absent fee shows “fee unavailable”. The CLI stores amount, deadline, intake and max awards in the order market metadata, then configures an optional webhook through the order webhook endpoint.
+Posting a task without `--fund` moves no money. The fee line shows gross · fee · net using the deployed `feeBp`; an absent fee shows “fee unavailable”. The CLI stores amount, deadline, intake and max awards in the order market metadata, then configures an optional webhook through the order webhook endpoint.
 
 Search applies `--open` and `--min` to the returned board page, including the pinned task. Tab and limit are sent to the board. Thread `--after` accepts the previous page's `nextBeforeSeq`. The SDK supports backward pagination through `beforeSeq`, so this reads older messages.
 
-Show uses the authenticated task route when a bearer exists; otherwise it reads the public card. Status always reads the public card. Public cards define `receiptUrl`, which is printed as supplied by the server. Private task milestones have `escrowContract` but no receipt URL field; settled milestones get `<origin>/receipts/<escrowContract>`, labeled as derived from escrow in human output and `receiptUrlSource: "escrow"` in JSON. All settled milestones remain listed in `receipts`.
+Show uses the authenticated task route when a bearer exists; otherwise it reads the public card. Status reads chain state and participant events when signed in, or the public card without sign-in. Public cards define `receiptUrl`, which is printed as supplied by the server. Private task milestones have `escrowContract` but no receipt URL field; settled milestones get `<origin>/receipts/<escrowContract>`, labeled as derived from escrow in human output and `receiptUrlSource: "escrow"` in JSON. All settled milestones remain listed in `receipts`.
 
-Public search, status, submissions, events and participant routes are available. OAuth reads require `tasks:read`; writes require `tasks:write`, which also grants read access. Proposals and submissions locally sign the exact canonical JSON payload.
+A server with Tasks enabled provides public search, status, submissions, events and participant routes. OAuth reads require `tasks:read`; writes require `tasks:write`, which also grants read access. Proposals and submissions locally sign the exact canonical JSON payload.
 
 Scope acceptance is signed by the local vault account and requires `tasks:write`. Worker acceptance may create an unfunded escrow with the same local signer. Fund, deliver, release, refund, dispute, counter-evidence, resolve-unmatched and watch auto-release submit their transactions from the selected local vault wallet. Base Sepolia reads `BASE_SEPOLIA_RPC_URL` and defaults to `https://sepolia.base.org`. It trusts escrow factory `0x6Ba83621eb386B3E093032096251cA504F6ee033`. Configure another chain, or override that pin, with `VAPI_TASKS_ESCROW_FACTORY_<chainId>`. Chains without a trusted factory are rejected before signing.
 
@@ -109,7 +111,43 @@ At exit `1`, invalid usage has JSON `{ok:false,error:{code:"usage_error",message
 
 Sign, fund, deliver and release wait up to `120s` for vAPI to index a confirmed transaction. `--no-wait` skips polling, while `--timeout` changes the limit. An indexing timeout prints a status command and keeps exit code `0` because the transaction succeeded.
 
-## Tasks v2
+## Tasks v2 (Base Sepolia beta)
+
+This Base Sepolia beta is unaudited: the Tasks v2 contracts go to an external audit before any mainnet deploy. Use test funds only.
+
+Post and fund in one call with the local vault. Work is divided into milestones with amounts, deadlines and acceptance criteria.
+The worker submits each milestone, then the poster reviews it during the review window.
+Approval releases payment; rejection sends the milestone back to the worker. Finalization releases eligible deliveries after the review window.
+Refund returns eligible remaining funds to the poster.
+
+The poster may dispute a fresh (submitted) delivery. The worker never disputes its own fresh delivery.
+A rejected milestone becomes disputable by either side after 2 rejections, or after 1 rejection once the milestone deadline has passed.
+With 20 or fewer eligible reviewers, everyone eligible votes; above 20, 5 reviewers are drawn.
+A verdict needs at least 3 revealed votes and a strict majority. A tie or no majority restores the milestone to its state before the dispute, and a new dispute may then be raised.
+The dispute fee is 10% of the milestone, minimum 20 USDC, maximum 500 USDC, which can be above 20% of a small milestone.
+A worker who delivered on time keeps the bond on a voluntary refund. There is no mediation and no appeal.
+
+The CLI verbs and matching local MCP tools are listed in [MCP](#mcp).
+Use `milestone` for submit, approve, reject and finalize; use `dispute`, `counter-evidence` and `resolve-unmatched` for disputes.
+The participant commands do not include jury voting commands.
+
+Base Sepolia uses chain 84532. The placeholders below are filled after the Sepolia deploy.
+The pin map remains empty, so these operator overrides are required before signing. This is a command template, not a verified live run.
+
+```sh
+export VAPI_TASKS_V2_ESCROW_FACTORY_84532='<ESCROW_FACTORY_V2>'
+export VAPI_TASKS_V2_DISPUTE_RESOLVER_V3_84532='<DISPUTE_RESOLVER_V3>'
+export VAPI_TASKS_V2_POOL_FACTORY_84532='<BOUNTY_POOL_FACTORY_V1>'
+export VAPI_TASKS_V2_USDC_84532='<USDC>'
+export VAPI_TASKS_V2_USDC_NAME_84532='USD Coin'
+export VAPI_TASKS_V2_USDC_VERSION_84532=2
+vapi task post --title "Research shortlist" --brief brief.md --amount 100 --deadline 7d \
+  --shape task --milestone "30|Shortlist approved|3d" \
+  --milestone "70|Intros completed|7d" --fund --yes
+```
+
+Confirm the deployed token domain before setting its name and version. In Conductor cloud environments, prefix these input names with `VAPI_NETWORK_`.
+The one-call flow depends on the server returning a supported funding preparation; the limitations below still apply.
 
 ```sh
 # One worker, two milestones; amounts sum to the budget.
@@ -279,10 +317,11 @@ V2 signing also requires a **local deployment trust anchor**. The V2 pin map is
 empty until the control room verifies the deployment ceremony. Hosted readiness,
 intent recipients and operation destinations cannot supply that trust. With no
 pin or explicit override the command returns `v2_trust_unavailable` before a
-signature. For staging, configure all five chain-specific variables, for example:
+signature. For staging, configure all six chain-specific variables, for example:
 
 ```sh
 VAPI_TASKS_V2_ESCROW_FACTORY_84532=0x...
+VAPI_TASKS_V2_DISPUTE_RESOLVER_V3_84532=0x...
 VAPI_TASKS_V2_POOL_FACTORY_84532=0x...
 VAPI_TASKS_V2_USDC_84532=0x...
 VAPI_TASKS_V2_USDC_NAME_84532='USD Coin'
@@ -306,7 +345,9 @@ over local defaults. Unset offer TTL and choice windows default to 604800 second
 staging can explicitly set
 `VAPI_TASKS_V2_OFFER_TTL_SECONDS_<chainId>` and
 `VAPI_TASKS_V2_CHOICE_WINDOW_SECONDS_<chainId>`, or the SDK pin's
-`offerTtlSeconds` and `choiceWindowSeconds`. The review window uses the existing
+`offerTtlSeconds` and `choiceWindowSeconds`. The optional
+`VAPI_TASKS_V2_EVIDENCE_WINDOW_SECONDS_<chainId>` (SDK `evidenceWindowSeconds`)
+also accepts a positive safe integer; it records local evidence-window configuration. The review window uses the existing
 local trusted duration setting. These are local decisions, never hosted
 readiness values. Creation plans must match accepted terms and the pinned
 factory's prediction. A hosted
