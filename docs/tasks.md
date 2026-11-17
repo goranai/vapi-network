@@ -416,7 +416,10 @@ vote reuses its sealed ballot. `vote --reveal` reads this wallet's onchain `comm
 voter)` and opens only the ballot with that commitment, so a replaced ballot whose commit never mined
 is never revealed. Reveal from the machine that committed; without the ballot there is nothing to
 reveal. Outcomes are `worker`, `poster` and `split` (DisputeResolverV3 order 0, 1, 2). `--to-worker`
-is USDC base units and only for `split`.
+is USDC base units and only for `split`. The vote and its salt leave the machine only in the signed
+reveal transaction: results, progress and errors carry the commitment, case and ballot path, the
+reveal calldata is shown as `[redacted: reveal calldata]`, and an RPC error from `voteCommitment`
+(which quotes its arguments) becomes `commitment_unavailable`.
 
 `reviewer-status` reads the chain directly. It takes the resolver from the local pin, or the pinned
 escrow factory's `disputeResolver()` getter, then reads the registry seat (`isReviewer`), the vAPI ID

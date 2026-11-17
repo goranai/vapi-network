@@ -74,6 +74,13 @@ const stateSchema = z.object({
   ),
 });
 const feeAbi = parseAbi(["function disputeFee(uint8) view returns (uint256)"]);
+/** Reveal calldata carries the vote and its salt; it is signed and broadcast, never echoed. */
+export const TASK_V2_REDACTED_CALLDATA = "[redacted: reveal calldata]";
+function shownOperation<T extends TaskV2OperationResponse["operation"]>(op: T, secret: boolean): T {
+  return secret
+    ? { ...op, plan: { ...op.plan, data: TASK_V2_REDACTED_CALLDATA as `0x${string}` } }
+    : op;
+}
 const fail = (message: string): never => {
   throw new TaskOperationError("invalid_response", message);
 };
@@ -150,6 +157,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
       ? taskV2ConsentSchema.parse(input.consent)
       : taskV2ActionSchema.parse(input.write);
     const verb = `v2:${canonicalJson(action)}`;
+    const secret = action.action === "reveal-vote";
     return pending.withFundingLock(input.id, async () => {
       let journal = await pending.preparation(input.id, verb);
       if (!journal) {
@@ -292,7 +300,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
         lifecycle: view.lifecycle ?? view.workOrder.lifecycle ?? null,
         nextAction: view.nextAction ?? view.workOrder.nextAction ?? null,
         ...(initialOperation.success
-          ? { operation: initialOperation.data.operation }
+          ? { operation: shownOperation(initialOperation.data.operation, secret) }
           : {
               operationId: taskV2IntentSchema.parse(current).operationId,
               operationState: "prepared" as const,
@@ -427,7 +435,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
         };
         for (let poll = 0; poll < 256; poll++) {
           validate(result);
-          progress = { ...progress, operation: result.operation };
+          progress = { ...progress, operation: shownOperation(result.operation, secret) };
           const op = result.operation;
           if (op.state === "confirmed") {
             if (op.step !== finalStep)
@@ -438,6 +446,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
               ok: true as const,
               money,
               ...result,
+              operation: shownOperation(result.operation, secret),
               lifecycle: fresh.lifecycle ?? fresh.workOrder.lifecycle ?? null,
               nextAction: fresh.nextAction ?? fresh.workOrder.nextAction ?? null,
             };
@@ -547,7 +556,10 @@ export function createTaskV2Executor(options: TasksChainOptions) {
           );
           progress = {
             ...progress,
-            operation: { ...op, state: "submitted", transactionHash: saved.txHash },
+            operation: shownOperation(
+              { ...op, state: "submitted", transactionHash: saved.txHash },
+              secret,
+            ),
           };
           const hash = await rpc.sendRawTransaction({ serializedTransaction: saved.raw });
           if (hash !== saved.txHash) fail("RPC returned a different transaction hash.");

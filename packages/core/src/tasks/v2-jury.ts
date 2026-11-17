@@ -114,22 +114,38 @@ export function createTaskV2Jury(options: TasksChainOptions) {
       await v2Read(rpc, resolver, disputeResolverV3Abi, "commitments", [caseId, account.address]),
     );
   }
-  /** Never re-implement the hash: the resolver's own voteCommitment view is the preimage rule. */
+  /**
+   * Never re-implement the hash: the resolver's own voteCommitment view is the preimage rule.
+   * An RPC error echoes the call arguments (the vote and its salt), so it is never propagated.
+   */
   async function commitmentOf(
     rpc: PublicClient,
     resolver: Address,
     ballot: Pick<TaskV2Ballot, "escrow" | "i" | "outcome" | "toWorker" | "salt">,
   ): Promise<Hex> {
-    return hash.parse(
-      await v2Read(rpc, resolver, disputeResolverV3Abi, "voteCommitment", [
+    let value: unknown;
+    try {
+      value = await v2Read(rpc, resolver, disputeResolverV3Abi, "voteCommitment", [
         getAddress(ballot.escrow),
         ballot.i,
         account.address,
         ballot.outcome,
         BigInt(ballot.toWorker),
         ballot.salt,
-      ]),
-    );
+      ]);
+    } catch {
+      throw new TaskOperationError(
+        "commitment_unavailable",
+        "The resolver's voteCommitment view could not be read over RPC. Nothing was sent; retry the same vote.",
+      );
+    }
+    const commitment = hash.safeParse(value);
+    if (!commitment.success)
+      throw new TaskOperationError(
+        "invalid_commitment",
+        "The resolver returned a malformed commitment.",
+      );
+    return commitment.data;
   }
 
   return {
@@ -290,7 +306,36 @@ export const taskV2VoteInputSchema = z
   });
 export type TaskV2VoteInput = z.input<typeof taskV2VoteInputSchema>;
 
-/** Commit seals the ballot locally first; reveal reads it back by the onchain commitment. */
+/**
+ * A failed vote step never echoes the ballot: the salt is scrubbed from every known error, and
+ * any other error (an RPC client error quotes its call arguments) becomes a fixed message.
+ */
+function sealedVoteError(error: unknown, salt?: Hex): never {
+  if (error instanceof TaskInputError) throw error;
+  if (!(error instanceof TaskOperationError))
+    throw new TaskOperationError(
+      "vote_failed",
+      "The vote step failed. The sealed ballot stays on this machine; retry the same command.",
+    );
+  if (!salt) throw error;
+  const pattern = new RegExp(salt.slice(2), "giu");
+  const scrub = (text: string) => text.replace(pattern, "[redacted]");
+  const details = error.details
+    ? (JSON.parse(
+        scrub(
+          JSON.stringify(error.details, (_, value: unknown) =>
+            typeof value === "bigint" ? value.toString() : value,
+          ),
+        ),
+      ) as Record<string, unknown>)
+    : undefined;
+  throw new TaskOperationError(error.code, scrub(error.message), error.manifestHash, details);
+}
+
+/**
+ * Commit seals the ballot locally first; reveal reads it back by the onchain commitment.
+ * Results carry the commitment, case and ballot path, never the vote or its salt.
+ */
 export async function runTaskV2Vote(
   context: TaskOperationContext,
   input: RunBase & TaskV2VoteInput,
@@ -305,16 +350,18 @@ export async function runTaskV2Vote(
   if (!parsed.success) throw new TaskInputError(parsed.error.issues[0]!.message);
   const vote = parsed.data;
   if (vote.action === "commit") {
-    const sealed = await jury(context).sealBallot({
-      id: input.id,
-      i: vote.i,
-      outcome: TASK_V2_VOTE_OUTCOMES.indexOf(vote.outcome!) as 0 | 1 | 2,
-      toWorker: vote.toWorker ?? "0",
-    });
+    const sealed = await jury(context)
+      .sealBallot({
+        id: input.id,
+        i: vote.i,
+        outcome: TASK_V2_VOTE_OUTCOMES.indexOf(vote.outcome!) as 0 | 1 | 2,
+        toWorker: vote.toWorker ?? "0",
+      })
+      .catch((error: unknown) => sealedVoteError(error));
     const result = await executeTaskV2(context, {
       ...base,
       write: { action: "commit-vote", i: vote.i, commitment: sealed.ballot.commitment },
-    });
+    }).catch((error: unknown) => sealedVoteError(error, sealed.ballot.salt));
     return {
       ...result,
       ballot: {
@@ -324,7 +371,9 @@ export async function runTaskV2Vote(
       },
     };
   }
-  const opened = await jury(context).openBallot({ id: input.id, i: vote.i });
+  const opened = await jury(context)
+    .openBallot({ id: input.id, i: vote.i })
+    .catch((error: unknown) => sealedVoteError(error));
   const result = await executeTaskV2(context, {
     ...base,
     write: {
@@ -334,14 +383,12 @@ export async function runTaskV2Vote(
       toWorker: opened.ballot.toWorker,
       salt: opened.ballot.salt,
     },
-  });
+  }).catch((error: unknown) => sealedVoteError(error, opened.ballot.salt));
   return {
     ...result,
     ballot: {
       commitment: opened.ballot.commitment,
       caseId: opened.ballot.caseId,
-      outcome: TASK_V2_VOTE_OUTCOMES[opened.ballot.outcome],
-      toWorker: opened.ballot.toWorker,
       path: opened.path,
     },
   };

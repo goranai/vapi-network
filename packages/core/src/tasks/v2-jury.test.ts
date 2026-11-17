@@ -25,7 +25,7 @@ import {
 } from "./ballots.js";
 import type { TasksChainOptions } from "./chain.js";
 import type { TasksClient } from "./client.js";
-import type { TaskOperationContext } from "./operation-support.js";
+import type { TaskOperationContext, TaskOperationError } from "./operation-support.js";
 import { createPendingTransactions } from "./pending-transactions.js";
 import { readSpendLedger } from "../spend-policy.js";
 import { disputeResolverV3Abi, escrowV2Abi } from "./v2-abi.js";
@@ -622,7 +622,7 @@ describe("V2 vote commit and reveal", () => {
     // The commit mined from another attempt with that sealed ballot; reveal finds it.
     f.chain.commitment = ballot!.commitment;
     const result = await runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" });
-    expect(result).toMatchObject({ ok: true, ballot: { outcome: "poster" } });
+    expect(result).toMatchObject({ ok: true, ballot: { commitment: ballot!.commitment } });
     expect(f.writes.at(-1)).toEqual({
       action: "reveal-vote",
       i: 0,
@@ -679,6 +679,67 @@ describe("V2 vote commit and reveal", () => {
         code: "invalid_input",
       });
     expect(f.rpc.readContract).not.toHaveBeenCalled();
+  });
+
+  it("never surfaces the salt when the voteCommitment RPC read fails", async () => {
+    const f = await fixture();
+    const original = f.rpc.readContract.getMockImplementation()!;
+    f.rpc.readContract.mockImplementation(async (call) => {
+      if (call.functionName === "voteCommitment")
+        // viem's ContractFunctionExecutionError quotes every call argument.
+        throw new Error(
+          `The contract function "voteCommitment" reverted. Args: ${JSON.stringify(
+            call.args,
+            (_, v: unknown) => (typeof v === "bigint" ? v.toString() : v),
+          )}`,
+        );
+      return original(call);
+    });
+    const error = await runTaskV2Vote(f.context, {
+      ...f.base,
+      i: 0,
+      action: "commit",
+      outcome: "split",
+      toWorker: "40000000",
+    }).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "commitment_unavailable" });
+    expect(String((error as Error).message)).not.toContain(SALT.slice(2, 18));
+    expect(String((error as Error).message)).not.toContain("40000000");
+    expect(f.client.prepareV2).not.toHaveBeenCalled();
+  });
+
+  it("keeps the salt out of reveal results, progress and signing errors", async () => {
+    const f = await fixture();
+    const sealed = await createTaskV2Jury(f.options).sealBallot({
+      id: V2_WRITE_ORDER,
+      i: 0,
+      outcome: 1,
+      toWorker: "0",
+    });
+    f.chain.commitment = sealed.ballot.commitment;
+    const ok = await runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" });
+    expect(ok).toMatchObject({ ok: true, ballot: { commitment: sealed.ballot.commitment } });
+    expect(JSON.stringify(ok)).not.toContain(SALT.slice(2, 18));
+    // A failure after the plan is verified carries the operation as progress, never its calldata.
+    const g = await fixture();
+    await createTaskV2Jury(g.options).sealBallot({
+      id: V2_WRITE_ORDER,
+      i: 0,
+      outcome: 1,
+      toWorker: "0",
+    });
+    g.chain.commitment = sealed.ballot.commitment;
+    g.rpc.getTransactionCount.mockRejectedValueOnce(new Error("rpc down"));
+    const error = (await runTaskV2Vote(g.context, { ...g.base, i: 0, action: "reveal" }).catch(
+      (caught: unknown) => caught,
+    )) as TaskOperationError;
+    expect(error).toBeInstanceOf(Error);
+    expect(JSON.stringify({ message: error.message, details: error.details })).not.toContain(
+      SALT.slice(2, 18),
+    );
+    expect(error.details).toMatchObject({
+      operation: { plan: { data: "[redacted: reveal calldata]" } },
+    });
   });
 
   it("refuses a second, different commit in the same round", async () => {

@@ -16,6 +16,7 @@ import {
   canonicalJson,
   TasksPartiesNotBoundError,
   TasksClientError,
+  TaskOperationError,
   createPendingTransactions,
   createTasksClient,
   missingTasksChain,
@@ -2484,6 +2485,38 @@ describe("V2 jury and reviewer tools", () => {
       expect(JSON.stringify(result.structuredContent)).not.toContain(SALT.slice(2, 12));
     },
   );
+
+  it("returns no salt or vote when a vote step fails", async () => {
+    for (const failure of ["seal", "execute"] as const) {
+      const fake = juryChain();
+      if (failure === "seal")
+        fake.juryV2.sealBallot.mockRejectedValueOnce(
+          new Error(`voteCommitment reverted with args [0, 2, "40000000", "${SALT}"]`),
+        );
+      else
+        fake.executeV2.mockRejectedValueOnce(
+          new TaskOperationError("chain_error", `estimate failed for ${SALT}`, undefined, {
+            operation: { plan: { data: `0xdeadbeef${SALT.slice(2)}` } },
+          }),
+        );
+      const { server } = await watchServer({
+        client: {} as TasksClient,
+        chain: fake.chain,
+        now: () => new Date(NOW),
+      });
+      const result = await server.callTool({
+        name: "tasks.vote",
+        arguments:
+          failure === "seal"
+            ? { id: ID, i: 0, action: "commit", outcome: "split", toWorker: "40000000" }
+            : { id: ID, i: 0, action: "reveal" },
+      });
+      expect(result.isError, failure).toBe(true);
+      const text = JSON.stringify(result);
+      expect(text, failure).not.toContain(SALT.slice(2, 18));
+      if (failure === "seal") expect(text).not.toContain("40000000");
+    }
+  });
 
   it("validates jury and vote arguments before any signing", async () => {
     const fake = juryChain();
