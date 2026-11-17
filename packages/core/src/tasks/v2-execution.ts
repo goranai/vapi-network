@@ -74,6 +74,15 @@ const stateSchema = z.object({
   ),
 });
 const feeAbi = parseAbi(["function disputeFee(uint8) view returns (uint256)"]);
+/**
+ * Headroom on the node's gas estimate for every V2 write, in percent (e2e finding F4: jury and
+ * snapshot steps whose cost depends on state read at execution ran out of gas at the bare
+ * estimate). Unused gas is not charged.
+ */
+export const TASK_V2_GAS_BUFFER_PERCENT = 25n;
+export function bufferedV2Gas(estimate: bigint) {
+  return (estimate * (100n + TASK_V2_GAS_BUFFER_PERCENT) + 99n) / 100n;
+}
 /** Reveal calldata carries the vote and its salt; it is signed and broadcast, never echoed. */
 export const TASK_V2_REDACTED_CALLDATA = "[redacted: reveal calldata]";
 function shownOperation<T extends TaskV2OperationResponse["operation"]>(op: T, secret: boolean): T {
@@ -527,7 +536,11 @@ export function createTaskV2Executor(options: TasksChainOptions) {
                 chainId: plan.chainId,
                 nonce,
               });
-              const raw = await account.signTransaction(request as TransactionSerializable);
+              if (request.gas === undefined) fail("The V2 transaction has no gas estimate.");
+              const raw = await account.signTransaction({
+                ...request,
+                gas: bufferedV2Gas(request.gas!),
+              } as TransactionSerializable);
               const decoded = parseTransaction(raw);
               if (
                 decoded.chainId !== plan.chainId ||

@@ -10,6 +10,7 @@ import {
   type Hex,
   type PublicClient,
   getAddress,
+  parseTransaction,
   toHex,
   zeroAddress,
   zeroHash,
@@ -839,6 +840,16 @@ describe("V2 amounts paid by the wallet", () => {
         .spentAtomic,
     ).toBe("20000000");
   });
+});
+
+it("signs every V2 write with a 25% buffer over the gas estimate", async () => {
+  const f = await fixture();
+  expect(await f.execute(f.input)).toMatchObject({ ok: true });
+  expect(f.sign).toHaveBeenCalledTimes(1);
+  // The mocked node estimate is 100000.
+  expect(f.sign.mock.calls[0]![0].gas).toBe(125000n);
+  const saved = await f.pending.get(V2_WRITE_OPERATION, "v2-approve");
+  expect(parseTransaction(saved!.raw as Hex).gas).toBe(125000n);
 });
 
 it("refuses to broadcast signed bytes that differ from the hosted plan", async () => {

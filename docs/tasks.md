@@ -269,7 +269,8 @@ the action. Stable hosted errors such as `v2_writes_disabled`,
 `chain_preflight_unavailable`, `v2_binding_mismatch`,
 `v2_funding_snapshot_unavailable` and `v1_order` retain their codes.
 
-Creation, approval and action steps run in sequence. A failed step stops the
+Creation, approval and action steps run in sequence. Each V2 transaction is signed with a 25%
+buffer over the node's gas estimate; unused gas is not charged. A failed step stops the
 sequence. Signed transaction bytes and preparation keys persist in the local
 pending journal; retrying the original command resumes its hosted operation.
 The CLI and SDK poll order-level confirm/reconcile and recover responses without
