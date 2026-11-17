@@ -470,7 +470,11 @@ reveal calldata is shown as `[redacted: reveal calldata]`, and an RPC error from
 (which quotes its arguments) becomes `commitment_unavailable`. A hosted error on a commit or reveal
 step is never copied, because it may echo the request: it becomes `v2_vote_rejected` with a fixed
 message. Results, errors and `status --operation` recovery or abandon output carry only documented
-fields; unknown hosted fields are dropped and reveal calldata is redacted by step and by selector.
+fields, down to each lifecycle milestone and the next action; unknown hosted fields are dropped and
+reveal calldata is redacted by step and by selector. During `status --operation` recovery or abandon,
+any failed hosted call, the order refresh included, is replaced whatever `--step` names: it becomes
+`v2_vote_rejected` for a commit or reveal step and `v2_recovery_failed` otherwise, with only the HTTP
+status kept.
 
 `reviewer-status` reads the chain directly. It takes the resolver from the pinned escrow factory's
 task implementation (`implementation()` then its immutable `DISPUTE_RESOLVER()`; the factory has no

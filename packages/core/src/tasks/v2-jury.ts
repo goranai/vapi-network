@@ -35,7 +35,12 @@ import { v2Read, verifiedV2Case, verifiedV2Resolver, verifyV2Target } from "./v2
 import { getTrustedTasksV2Deployment, type TasksV2DeploymentOverrides } from "./v2-trust.js";
 import { taskV2IndexSchema, type TaskV2Action } from "./v2-write.js";
 import { TasksClientError } from "./client.js";
-import { publicTaskV2OperationOf, taskV2VoteHostedError } from "./v2-public.js";
+import {
+  publicTaskLifecycle,
+  publicTaskNextAction,
+  publicTaskV2OperationOf,
+  taskV2VoteHostedError,
+} from "./v2-public.js";
 import type { PublicClient } from "viem";
 
 /** DisputeResolverV3 case states (vapi-app tasks-v2.ts CaseState). Snapshotting was appended. */
@@ -441,8 +446,8 @@ function publicVoteResult(
     ...(operation ? { operation } : {}),
     ...(typeof result.operationId === "string" ? { operationId: result.operationId } : {}),
     ...(typeof result.operationState === "string" ? { operationState: result.operationState } : {}),
-    lifecycle: result.lifecycle ?? null,
-    nextAction: result.nextAction ?? null,
+    lifecycle: publicTaskLifecycle(result.lifecycle),
+    nextAction: publicTaskNextAction(result.nextAction),
     ballot,
   };
 }

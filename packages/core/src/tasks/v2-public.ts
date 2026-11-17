@@ -9,6 +9,7 @@ import { z } from "zod";
 import { TasksClientError } from "./client.js";
 import { TaskOperationError } from "./operation-support.js";
 import { disputeResolverV3Abi } from "./v2-abi.js";
+import type { TaskLifecycle, TaskNextAction } from "./v2.js";
 import type { TaskV2Action, TaskV2Consent, TaskV2Operation } from "./v2-write.js";
 
 /** Reveal calldata carries the vote and its salt; it is signed and broadcast, never echoed. */
@@ -105,6 +106,123 @@ export function publicTaskV2Recovery(
     ...(typeof response.scanComplete === "boolean" ? { scanComplete: response.scanComplete } : {}),
     ...(response.outcome === undefined ? {} : { outcome: response.outcome }),
   };
+}
+
+const lifecycleShape = z.enum(["task", "bounty", "pool"]);
+const lifecycleState = z.enum([
+  "Draft",
+  "Open",
+  "Active",
+  "Settled",
+  "Refunded",
+  "Cancelled",
+  "Judging",
+  "Awarded",
+  "Paused",
+  "Closed",
+]);
+const lifecycleSubstate = z.enum(["InProgress", "Submitted", "Stalled", "Disputed"]);
+const milestoneStatus = z.enum([
+  "pending",
+  "submitted",
+  "released",
+  "refunded",
+  "disputed",
+  "split",
+]);
+const nextActionKind = z.enum([
+  "award",
+  "release",
+  "deliver",
+  "counter-evidence",
+  "checkin",
+  "judge",
+  "none",
+]);
+const baseUnits = z.string().regex(/^[0-9]{1,78}$/u);
+const shownInstant = z.iso.datetime();
+const milestoneId = z.string().max(128);
+const record = (value: unknown): Record<string, unknown> | undefined =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+/** One documented field, kept only when it parses; any other field is dropped. */
+function pick<T>(source: Record<string, unknown>, key: string, schema: z.ZodType<T>) {
+  const parsed = schema.safeParse(source[key]);
+  return parsed.success ? ({ [key]: parsed.data } as Record<string, T>) : {};
+}
+
+/**
+ * The documented lifecycle fields (shape, state, substate, amount, due date and each
+ * milestone's id, status, amount and due date). Hosted lifecycle and next-action objects are
+ * loose on the wire, so a nested unknown field (for example an echoed `debug` with the
+ * ballot) would otherwise reach SDK results, CLI JSON and MCP results.
+ */
+export function publicTaskLifecycle(value: unknown): TaskLifecycle | null {
+  const source = record(value);
+  if (!source) return null;
+  const milestones = Array.isArray(source.milestones)
+    ? source.milestones.flatMap((item: unknown) => {
+        const m = record(item);
+        return m
+          ? [
+              {
+                ...pick(m, "id", milestoneId),
+                ...pick(m, "status", milestoneStatus),
+                ...pick(m, "amountBaseUnits", baseUnits),
+                ...pick(m, "dueAt", shownInstant),
+              },
+            ]
+          : [];
+      })
+    : undefined;
+  return {
+    ...pick(source, "shape", lifecycleShape),
+    ...pick(source, "state", lifecycleState),
+    ...pick(source, "substate", lifecycleSubstate),
+    ...pick(source, "amountBaseUnits", baseUnits),
+    ...pick(source, "dueAt", shownInstant),
+    ...(milestones ? { milestones } : {}),
+  } as unknown as TaskLifecycle;
+}
+
+/** The documented next-action fields (action, amount, due date); nothing else is copied. */
+export function publicTaskNextAction(value: unknown): TaskNextAction | null {
+  const source = record(value);
+  if (!source) return null;
+  return {
+    ...pick(source, "action", nextActionKind),
+    ...pick(source, "amountBaseUnits", baseUnits),
+    ...pick(source, "dueAt", shownInstant),
+  } as unknown as TaskNextAction;
+}
+
+/** The public lifecycle and next action of a hosted order view. */
+export function publicTaskV2Progress(view: {
+  lifecycle?: unknown;
+  nextAction?: unknown;
+  workOrder?: { lifecycle?: unknown; nextAction?: unknown };
+}) {
+  return {
+    lifecycle: publicTaskLifecycle(view.lifecycle ?? view.workOrder?.lifecycle ?? null),
+    nextAction: publicTaskNextAction(view.nextAction ?? view.workOrder?.nextAction ?? null),
+  };
+}
+
+/**
+ * Every failure of a hosted call during recovery or abandon. The caller-supplied step does
+ * not decide sensitivity: the operation behind it may be a reveal whatever step is named, and
+ * a hosted error (or a transport error quoting the response) may echo the prepared request.
+ * Only the HTTP status survives; the code is fixed per path.
+ */
+export function taskV2RecoveryHostedError(error: unknown, step: string) {
+  if (TASK_V2_SECRET_STEPS.includes(step)) return taskV2VoteHostedError(error);
+  return new TaskOperationError(
+    "v2_recovery_failed",
+    `The hosted API did not complete the operation recovery${
+      error instanceof TasksClientError && error.status ? ` (HTTP ${error.status})` : ""
+    }. Retry the same status command; nothing was signed.`,
+  );
 }
 
 /**

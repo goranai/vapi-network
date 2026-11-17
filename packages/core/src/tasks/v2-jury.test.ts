@@ -898,6 +898,138 @@ describe("hosted echoes on vote paths", () => {
     expect(direct).toMatchObject({ ok: true });
     expect(leaks(direct)).toBe(false);
   });
+
+  /** A hosted view whose loose lifecycle and next action carry the echoed ballot. */
+  function echoLifecycle(f: Awaited<ReturnType<typeof fixture>>) {
+    Object.assign(f.order as Record<string, unknown>, {
+      lifecycle: {
+        shape: "task",
+        state: "Active",
+        substate: "Disputed",
+        debug: ECHO,
+        milestones: [
+          { id: "m1", status: "disputed", amountBaseUnits: "100000000", debug: ECHO, ECHO },
+        ],
+      },
+      nextAction: { action: "judge", debug: ECHO, request: { salt: SALT } },
+    });
+  }
+  const shownLifecycle = {
+    lifecycle: {
+      shape: "task",
+      state: "Active",
+      substate: "Disputed",
+      milestones: [{ id: "m1", status: "disputed", amountBaseUnits: "100000000" }],
+    },
+    nextAction: { action: "judge" },
+  };
+
+  it("projects hosted lifecycle and nextAction in reveal results, progress and recovery", async () => {
+    const { f, reveal, prepared } = await splitBallot();
+    echoLifecycle(f);
+    // Success, through the vote verb and the direct executor.
+    const voted = await runTaskV2Vote(f.context, { ...f.base, i: 0, action: "reveal" });
+    expect(voted).toMatchObject({ ok: true, ...shownLifecycle });
+    expect(leaks(voted), JSON.stringify(voted)).toBe(false);
+    const g = (await splitBallot()).f;
+    echoLifecycle(g);
+    const direct = await createTaskV2Executor(g.options)({ ...g.base, write: reveal });
+    expect(direct).toMatchObject({ ok: true, ...shownLifecycle });
+    expect(leaks(direct), JSON.stringify(direct)).toBe(false);
+    // Progress carried by a signing-loop error.
+    const h = (await splitBallot()).f;
+    echoLifecycle(h);
+    h.rpc.getTransactionCount.mockRejectedValueOnce(new Error("rpc down"));
+    const error = await createTaskV2Executor(h.options)({ ...h.base, write: reveal }).catch(
+      (caught: unknown) => caught,
+    );
+    expect((error as TaskOperationError).details).toMatchObject(shownLifecycle);
+    expect(leaks(errorView(error)), JSON.stringify(errorView(error))).toBe(false);
+    // Recovery and abandon, whatever step the caller names.
+    f.client.operationV2.mockImplementation((async (_id: string, mode: string) =>
+      mode === "abandon"
+        ? { orderId: V2_WRITE_ORDER, outcome: "abandoned", operation: null }
+        : { ...prepared, recovered: true, scanComplete: true }) as never);
+    for (const step of ["v2-reveal-vote", "v2-approve"])
+      for (const abandon of [false, true]) {
+        const result = await recoverTaskV2(f.context, {
+          id: V2_WRITE_ORDER,
+          operationId: V2_WRITE_OPERATION,
+          step,
+          abandon,
+        });
+        expect(result, `${step} ${abandon}`).toMatchObject(shownLifecycle);
+        expect(leaks(result), `${step} ${abandon}`).toBe(false);
+      }
+  });
+
+  it("projects a lifecycle that sits on the work order and drops malformed fields", async () => {
+    const { f, reveal } = await splitBallot();
+    Object.assign(f.order as Record<string, unknown>, {
+      lifecycle: undefined,
+      nextAction: undefined,
+    });
+    Object.assign(f.order.workOrder as Record<string, unknown>, {
+      lifecycle: { shape: "task", state: SALT, milestones: [{ id: "m1", debug: ECHO }] },
+      nextAction: { action: "judge", amountBaseUnits: SALT, dueAt: SALT },
+    });
+    const direct = await createTaskV2Executor(f.options)({ ...f.base, write: reveal });
+    expect(direct).toMatchObject({
+      ok: true,
+      lifecycle: { shape: "task", milestones: [{ id: "m1" }] },
+      nextAction: { action: "judge" },
+    });
+    expect(leaks(direct), JSON.stringify(direct)).toBe(false);
+  });
+
+  it("sanitizes an echoed order refresh failure during recovery and abandon", async () => {
+    const { f, prepared } = await splitBallot();
+    f.client.operationV2.mockImplementation((async (_id: string, mode: string) =>
+      mode === "abandon"
+        ? { orderId: V2_WRITE_ORDER, outcome: "abandoned", operation: null }
+        : { ...prepared, recovered: true, scanComplete: true }) as never);
+    for (const failure of [
+      () => new TasksClientError("http", `order ${JSON.stringify(ECHO)}`, 409, SALT.slice(2)),
+      () => new Error(`fetch failed: response ${JSON.stringify(ECHO)}`),
+    ])
+      for (const [step, code] of [
+        ["v2-reveal-vote", "v2_vote_rejected"],
+        ["v2-approve", "v2_recovery_failed"],
+      ] as const)
+        for (const abandon of [false, true]) {
+          f.client.getOrder.mockRejectedValueOnce(failure());
+          const error = await recoverTaskV2(f.context, {
+            id: V2_WRITE_ORDER,
+            operationId: V2_WRITE_OPERATION,
+            step,
+            abandon,
+          }).catch((caught: unknown) => caught);
+          expect(error, `${step} ${abandon}`).toMatchObject({ code });
+          expect(leaks(errorView(error)), `${step} ${abandon}`).toBe(false);
+        }
+  });
+
+  it("sanitizes an echoed recovery or abandon failure when a non-secret step is named", async () => {
+    const { f } = await splitBallot();
+    for (const failure of [
+      () => new TasksClientError("http", `no such step for salt ${SALT} / ${SPLIT}`, 409, SALT),
+      () => new Error(`socket closed after ${JSON.stringify(ECHO)}`),
+    ])
+      for (const abandon of [false, true]) {
+        f.client.operationV2.mockRejectedValueOnce(failure());
+        const error = await recoverTaskV2(f.context, {
+          id: V2_WRITE_ORDER,
+          operationId: V2_WRITE_OPERATION,
+          step: "v2-approve",
+          abandon,
+        }).catch((caught: unknown) => caught);
+        expect(error, String(abandon)).toMatchObject({ code: "v2_recovery_failed" });
+        expect((error as Error).message).toContain(
+          failure() instanceof TasksClientError ? "HTTP 409" : "recovery",
+        );
+        expect(leaks(errorView(error)), String(abandon)).toBe(false);
+      }
+  });
 });
 
 describe("V2 jury, bond and owed steps", () => {

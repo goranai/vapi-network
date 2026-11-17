@@ -50,8 +50,9 @@ import { canonicalJson } from "./canonical-json.js";
 import {
   isTaskV2SecretAction,
   publicTaskV2Operation,
+  publicTaskV2Progress,
   publicTaskV2Recovery,
-  TASK_V2_SECRET_STEPS,
+  taskV2RecoveryHostedError,
   taskV2VoteHostedError,
 } from "./v2-public.js";
 
@@ -313,8 +314,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
         const initialOperation = taskV2OperationResponseSchema.safeParse(current);
         let progress = {
           orderId: input.id,
-          lifecycle: view.lifecycle ?? view.workOrder.lifecycle ?? null,
-          nextAction: view.nextAction ?? view.workOrder.nextAction ?? null,
+          ...publicTaskV2Progress(view),
           ...(initialOperation.success
             ? { operation: publicTaskV2Operation(initialOperation.data.operation, secret) }
             : {
@@ -409,8 +409,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
                 expiry: consentResponse.expiry,
                 operationId: intent.operationId,
                 operationState: "confirmed" as const,
-                lifecycle: view.lifecycle ?? view.workOrder.lifecycle ?? null,
-                nextAction: view.nextAction ?? view.workOrder.nextAction ?? null,
+                ...publicTaskV2Progress(view),
               };
             }
             current = taskV2OperationResponseSchema.parse(response);
@@ -467,8 +466,7 @@ export function createTaskV2Executor(options: TasksChainOptions) {
                 money,
                 orderId: result.orderId,
                 operation: publicTaskV2Operation(result.operation, secret),
-                lifecycle: fresh.lifecycle ?? fresh.workOrder.lifecycle ?? null,
-                nextAction: fresh.nextAction ?? fresh.workOrder.nextAction ?? null,
+                ...publicTaskV2Progress(fresh),
               };
             }
             if (op.state === "abandoned") fail("The hosted operation was abandoned.");
@@ -643,19 +641,21 @@ export async function recoverTaskV2(
 ) {
   if (!context.client.operationV2)
     throw new TaskOperationError("unsupported", "V2 operation recovery is unavailable.");
-  const secret = TASK_V2_SECRET_STEPS.includes(input.step);
+  // Every hosted call here may echo the prepared request (a reveal carries the ballot), and
+  // the named step is caller input, so each failure is replaced whatever step was named.
+  const hosted = <T>(call: () => Promise<T>) =>
+    call().catch((error: unknown): never => {
+      throw taskV2RecoveryHostedError(error, input.step);
+    });
   for (let poll = 0; poll < 256; poll++) {
-    const response = await context.client
-      .operationV2(
+    const response = await hosted(() =>
+      context.client.operationV2!(
         input.operationId,
         input.abandon ? "abandon" : "recover",
         { step: input.step },
         { idempotencyKey: context.randomUUID() },
-      )
-      .catch((error: unknown) => {
-        if (secret && error instanceof TasksClientError) throw taskV2VoteHostedError(error);
-        throw error;
-      });
+      ),
+    );
     if (
       response.orderId !== input.id ||
       (response.operation && response.operation.id !== input.operationId)
@@ -668,12 +668,8 @@ export async function recoverTaskV2(
         response.operation?.state !== "submitted") ||
       response.operation?.state === "confirmed"
     ) {
-      const view = await context.client.getOrder(input.id);
-      return {
-        ...publicTaskV2Recovery(response, input.step),
-        lifecycle: view.lifecycle ?? view.workOrder.lifecycle ?? null,
-        nextAction: view.nextAction ?? view.workOrder.nextAction ?? null,
-      };
+      const view = await hosted(() => context.client.getOrder(input.id));
+      return { ...publicTaskV2Recovery(response, input.step), ...publicTaskV2Progress(view) };
     }
     await (
       context.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
