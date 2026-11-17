@@ -432,6 +432,7 @@ function lazyTasksChain(
     },
     juryV2: {
       caseState: async (input) => (await juryV2()).caseState(input),
+      assertJuryOpenable: async (input) => (await juryV2()).assertJuryOpenable(input),
       sealBallot: async (input) => (await juryV2()).sealBallot(input),
       openBallot: async (input) => (await juryV2()).openBallot(input),
     },
