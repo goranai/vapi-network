@@ -18,6 +18,7 @@ import type { Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { readAuditLog } from "./audit.js";
+import { __setAtomicFileTestHooks } from "./atomic-file.js";
 import { withAccountMovementLock } from "./account-movement-lock.js";
 import { DEFAULT_CEILING_ATOMIC, DEFAULT_SPEND_CAPS, getVapiPaths } from "./config.js";
 import { createFileSecretStore, fileSecretStore } from "./file-secret-store.js";
@@ -29,6 +30,7 @@ import {
   unlockKeystore,
 } from "./keystore.js";
 import {
+  __setReceiptTestHooks,
   appendReceipt,
   filterReceiptsByWallet,
   readReceipts,
@@ -67,6 +69,8 @@ const secretStores = new Map<string, SecretStore>();
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  __setAtomicFileTestHooks(undefined);
+  __setReceiptTestHooks(undefined);
   delete process.env.VAPI_WALLET;
   const directories = temporaryDirectories.splice(0);
   for (const directory of directories) secretStores.delete(directory);
@@ -912,6 +916,129 @@ describe("wallet store", () => {
     SLOW,
   );
 
+  it.each([undefined, 0, 7.25, -1, Infinity, NaN])(
+    "validates and persists the Router purchased baseline %s",
+    async (baseline) => {
+      const home = await makeHome();
+      const store = await openStore(home);
+      await store.create("main", PASSPHRASE);
+      const pending = {
+        receiptId: "baseline-journal",
+        status: "settled" as const,
+        createdAt: "2026-11-07T10:00:00.000Z",
+        tierUsd: 5 as const,
+        link: {
+          apiBase: "https://console.example",
+          clientId: "client",
+          owner: "0x1111111111111111111111111111111111111111" as const,
+          label: "test",
+          scopes: [],
+          linkedAt: "2026-11-07T10:00:00.000Z",
+        },
+        ...(baseline === undefined ? {} : { baselinePurchasedUsd: baseline }),
+      };
+      if (baseline !== undefined && (!Number.isFinite(baseline) || baseline < 0)) {
+        await expect(store.setRouterPendingPurchase("main", pending)).rejects.toThrow();
+        expect((await openStore(home)).entry("main")?.routerPendingPurchase).toBeUndefined();
+      } else {
+        await store.setRouterPendingPurchase("main", pending);
+        expect((await openStore(home)).entry("main")?.routerPendingPurchase).toEqual(pending);
+      }
+    },
+  );
+
+  it.each(["rename", "remove"] as const)(
+    "refuses %s while a Router purchase is pending, then permits it after clearing",
+    async (operation) => {
+      const home = await makeHome();
+      const store = await openStore(home);
+      await store.create("main", PASSPHRASE);
+      await store.create("agent", PASSPHRASE);
+      const stale = await openStore(home);
+      const pending = {
+        receiptId: "account-change-guard",
+        status: "prepared" as const,
+        createdAt: "2026-11-07T10:00:00.000Z",
+        tierUsd: 5 as const,
+        link: {
+          apiBase: "https://console.example",
+          clientId: "client",
+          owner: "0x1111111111111111111111111111111111111111" as const,
+          label: "test",
+          scopes: [],
+          linkedAt: "2026-11-07T10:00:00.000Z",
+        },
+      };
+      await store.setRouterPendingPurchase("agent", pending);
+      const evidencePath = join(home, "router-pending", "agent.json");
+      const evidence = await readFile(evidencePath, "utf8");
+      const change = () =>
+        operation === "rename"
+          ? stale.rename("agent", "renamed-agent")
+          : stale.remove("agent", { force: true });
+      await expect(change()).rejects.toThrow(/Router purchase.*vapi router clear-pending/iu);
+      expect(await readFile(evidencePath, "utf8")).toBe(evidence);
+      const reopened = await openStore(home);
+      expect(reopened.has("agent")).toBe(true);
+      expect(reopened.has("renamed-agent")).toBe(false);
+      expect(
+        (await readVaultFileUnlocked(join(home, "vault.json"))).accounts.some(
+          (entry) => entry.name === "agent",
+        ),
+      ).toBe(true);
+      await reopened.setRouterPendingPurchase("agent", null, pending.receiptId);
+      await expect(change()).resolves.toMatchObject({
+        name: operation === "rename" ? "renamed-agent" : "agent",
+      });
+    },
+  );
+
+  it.each(["rename", "remove"] as const)(
+    "waits for the Router purchase lock before deciding whether to %s",
+    async (operation) => {
+      const home = await makeHome();
+      const store = await openStore(home);
+      await store.create("main", PASSPHRASE);
+      await store.create("agent", PASSPHRASE);
+      const stale = await openStore(home);
+      let attempted!: () => void;
+      const attempting = new Promise<void>((resolve) => {
+        attempted = resolve;
+      });
+      let changing: Promise<unknown> | undefined;
+      await store.withRouterPurchaseLock("agent", async () => {
+        __setAtomicFileTestHooks({
+          beforeLockAttempt: (path) => {
+            if (path === join(home, "router-pending", "agent.json.purchase.lock")) attempted();
+          },
+        });
+        changing =
+          operation === "rename"
+            ? stale.rename("agent", "renamed-agent")
+            : stale.remove("agent", { force: true });
+        await attempting;
+        await store.setRouterPendingPurchase("agent", {
+          receiptId: "reserved-while-mutation-waits",
+          status: "prepared",
+          createdAt: "2026-11-07T10:00:00.000Z",
+          tierUsd: 5,
+          link: {
+            apiBase: "https://console.example",
+            clientId: "client",
+            owner: "0x1111111111111111111111111111111111111111",
+            label: "test",
+            scopes: [],
+            linkedAt: "2026-11-07T10:00:00.000Z",
+          },
+        });
+      });
+      await expect(changing).rejects.toThrow(/Router purchase.*vapi router clear-pending/iu);
+      expect((await openStore(home)).entry("agent")?.routerPendingPurchase?.receiptId).toBe(
+        "reserved-while-mutation-waits",
+      );
+    },
+  );
+
   it(
     "renames the vault account, the registry entry and the receipts of a wallet",
     async () => {
@@ -947,6 +1074,39 @@ describe("wallet store", () => {
     },
     SLOW,
   );
+
+  it("completes a wallet rename when the receipt directory sync fails after replacement", async () => {
+    const home = await makeHome();
+    const store = await openStore(home);
+    await store.create("main", PASSPHRASE);
+    const paths = getVapiPaths(home);
+    await appendReceipt(receipt("renamed-receipt", "main"), paths.receipts);
+    let directorySyncs = 0;
+    __setReceiptTestHooks({
+      beforeSync: (target) => {
+        if (target === home) {
+          directorySyncs += 1;
+          throw new Error("receipt directory sync failed");
+        }
+      },
+    });
+
+    await expect(store.rename("main", "research")).resolves.toMatchObject({ name: "research" });
+    expect(directorySyncs).toBe(1);
+    const reopened = await openStore(home);
+    expect(reopened.has("main")).toBe(false);
+    expect(reopened.has("research")).toBe(true);
+    expect((await reopened.unlock("research", PASSPHRASE)).address).toBeDefined();
+    expect(
+      (await readVaultFileUnlocked(join(home, "vault.json"))).accounts.map(
+        (account) => account.name,
+      ),
+    ).toEqual(["research"]);
+    expect(await readReceipts(paths.receipts)).toMatchObject([
+      { id: "renamed-receipt", wallet: "research" },
+    ]);
+    expect(await temporaryFiles(home)).toEqual([]);
+  });
 
   it(
     "rolls back an account rename when the receipt journal stays busy",

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import { formatEther, type Address } from "viem";
+import { RouterClientError } from "@vapi-network/core/router-client";
 
 import {
   BASE_MAINNET_CAIP2,
@@ -61,6 +62,7 @@ import {
   swarmParentResolver,
   sweepAboveCeiling,
   SweepGasError,
+  SwarmError,
   TransferError,
   sweepBack,
   sweepNativeEth,
@@ -194,7 +196,7 @@ import {
   type ProbeRejection,
   type ProbeResult,
 } from "./publish-client.js";
-import { CLI_VERSION } from "./version";
+import { CLI_VERSION } from "./version.js";
 
 const HELP_HEADING = "vAPI Network";
 
@@ -225,6 +227,7 @@ Usage:
   vapi swarm run <name> "<task>" --mode each --runtime railway --checkpoint <name> --allow-remote-key [--budget <usd>] [--keep-sandbox] [--json]
   vapi swarm runs <name> [--json]
   vapi swarm stop <name> [<runId>|--all] [--confirm-worker-stopped] [--json]
+  vapi swarm forget-run <name> <runId> --confirm-destroyed [--json]
   vapi send <amount> --from <account> --to <account|owner|0x…> [--network base|arc] [--resume <nonce>] [--json]
   vapi fund [--amount <usd>] [--account <name>] [--json]
   vapi docs "<question>" [--json]
@@ -264,6 +267,7 @@ Usage:
   vapi router buy --auto <1|5|20|50> --below <usd> [--account <name>] [--json]
   vapi router buy --auto off [--account <name>] [--json]
   vapi router key [--rotate] [--account <name>] [--json]
+  vapi router clear-pending [--confirm-unpaid|--confirm-settled] [--account <name>] [--json]
   vapi stake status [--account <name>] [--json]
   vapi stake open [--account <name>] [--no-browser] [--json]
   vapi task search [--open] [--min <usd>] [--tab trending|new|closing|paid] [--limit <n>] [--json]
@@ -850,7 +854,12 @@ export async function runCli(
         exitCode = 0;
         break;
       case "agent":
-        exitCode = await agentCommand(args.slice(1), json, runIo, dependencies);
+        exitCode = await agentCommand(
+          args.slice(1),
+          json,
+          args[1] === "run" && args.includes("--bundle-env") ? io : runIo,
+          dependencies,
+        );
         break;
       case "dashboard":
         await dashboardCommand(args.slice(1), json, io, dependencies);
@@ -1005,7 +1014,13 @@ export async function runCli(
           JSON.stringify({
             error: message,
             exitCode: code,
-            ...(error instanceof RuntimeError ? { code: error.code } : {}),
+            ...(error instanceof RuntimeError ||
+            (error instanceof SwarmError && error.code === "swarm_workers_active")
+              ? { code: error.code }
+              : {}),
+            ...(error instanceof RouterClientError && error.refill !== undefined
+              ? { code: error.code, refill: error.toJSON().refill }
+              : {}),
             ...(error instanceof VapiCallError ? { code: error.code } : {}),
             ...(error instanceof DocsError ? { code: error.code } : {}),
             ...(error instanceof RemoteKeyRefusedError ? { code: error.code } : {}),
@@ -1025,6 +1040,11 @@ export async function runCli(
           ? `${errorCode}: ${message}`
           : message,
       );
+      if (error instanceof RouterClientError && error.refill !== undefined) {
+        const receipt = error.toJSON().refill!.receipt;
+        runIo.stderr(`Receipt: ${receipt.id}`);
+        if (receipt.transaction !== undefined) runIo.stderr(`Transaction: ${receipt.transaction}`);
+      }
     }
     if (shouldAutoUploadAfterFailure(argv.filter((argument) => argument !== "--json"))) {
       await autoUploadBackup(io, json, dependencies);
@@ -3741,6 +3761,7 @@ async function mcpCommand(argv: string[], dependencies: CliDependencies): Promis
     receiptsPath: paths.receipts,
     searchesPath: paths.searches,
     runtime: resolveRuntime("local", paths.directory, dependencies),
+    runtimeForStop: (kind) => resolveRuntime(kind, paths.directory, dependencies),
   });
 }
 

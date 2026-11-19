@@ -1,20 +1,250 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { appendReceipt, parseReceipt, readReceipts, type Receipt } from "./receipts.js";
+import {
+  __setReceiptTestHooks,
+  appendReceipt,
+  parseReceipt,
+  readReceipts,
+  renameReceiptWallet,
+  syncReceipts,
+  type Receipt,
+} from "./receipts.js";
 
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  __setReceiptTestHooks(undefined);
   await Promise.all(
     temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
 });
 
 describe("receipts ledger", () => {
+  it("syncs each append and the directory on creation, and rejects a missing sync target", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-sync-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "receipts.jsonl");
+    const synced: string[] = [];
+    __setReceiptTestHooks({
+      afterSync: (path) => {
+        synced.push(path);
+      },
+    });
+    const receipt: Receipt = {
+      id: "durable",
+      timestamp: "2026-09-10T08:00:00.000Z",
+      resourceUrl: "https://api.example/paid",
+    };
+    await appendReceipt(receipt, path);
+    expect(synced).toEqual([path, directory]);
+    await appendReceipt({ ...receipt, id: "next" }, path);
+    expect(synced).toEqual([path, directory, path]);
+    synced.length = 0;
+    await syncReceipts(path);
+    expect(synced).toEqual([path, directory]);
+    await expect(syncReceipts(join(directory, "missing"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("syncs only the ledger file at the durability gate on Windows", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-win32-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "receipts.jsonl");
+    await writeFile(path, "");
+    const attempts: string[] = [];
+    __setReceiptTestHooks({
+      beforeSync: (candidate) => {
+        attempts.push(candidate);
+        if (candidate === directory) throw new Error("directory sync is not supported");
+      },
+    });
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      await syncReceipts(path);
+    } finally {
+      platform.mockRestore();
+    }
+    expect(attempts).toEqual([path]);
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "syncs an existing read-only ledger at the strict gate on POSIX",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-readonly-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "receipts.jsonl");
+      const receipt: Receipt = {
+        id: "recorded",
+        timestamp: "2026-09-10T08:00:00.000Z",
+        resourceUrl: "https://api.example/paid",
+      };
+      await appendReceipt(receipt, path);
+      await chmod(path, 0o400);
+      try {
+        await expect(syncReceipts(path)).resolves.toBeUndefined();
+        expect(await readReceipts(path)).toEqual([receipt]);
+      } finally {
+        await chmod(path, 0o600);
+      }
+    },
+  );
+
+  it("uses a writable file handle on Windows without creating a missing ledger on either platform", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-writable-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "receipts.jsonl");
+    await writeFile(path, "ledger");
+    const written = vi.fn();
+    __setReceiptTestHooks({
+      beforeSync: async (candidate, handle) => {
+        if (candidate !== path) return;
+        await handle.write("ledger", 0, "utf8");
+        written();
+      },
+    });
+    const missing = join(directory, "missing.jsonl");
+    await expect(syncReceipts(missing)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(directory)).toEqual(["receipts.jsonl"]);
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    try {
+      await syncReceipts(path);
+      await expect(syncReceipts(missing)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(directory)).toEqual(["receipts.jsonl"]);
+    } finally {
+      platform.mockRestore();
+    }
+    expect(written).toHaveBeenCalledTimes(1);
+    expect(await readFile(path, "utf8")).toBe("ledger");
+  });
+
+  it.each(["file", "directory"] as const)(
+    "rejects a %s sync failure at the strict durability gate",
+    async (target) => {
+      const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-strict-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "receipts.jsonl");
+      await writeFile(path, "");
+      const attempts: string[] = [];
+      __setReceiptTestHooks({
+        beforeSync: (candidate) => {
+          attempts.push(candidate);
+          if (candidate === (target === "file" ? path : directory)) throw new Error("sync failed");
+        },
+      });
+      await expect(syncReceipts(path)).rejects.toThrow("sync failed");
+      expect(attempts).toEqual(target === "file" ? [path] : [path, directory]);
+    },
+  );
+
+  it.each(["file", "directory"] as const)(
+    "returns the written receipt despite a %s sync failure at append",
+    async (target) => {
+      const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-best-effort-"));
+      temporaryDirectories.push(directory);
+      const path = join(directory, "receipts.jsonl");
+      const row: Receipt = {
+        id: "written",
+        timestamp: "2026-09-10T08:00:00.000Z",
+        resourceUrl: "https://api.example/paid",
+      };
+      const attempts: string[] = [];
+      __setReceiptTestHooks({
+        beforeSync: (candidate) => {
+          attempts.push(candidate);
+          if (candidate === (target === "file" ? path : directory)) throw new Error("sync failed");
+        },
+      });
+      await expect(appendReceipt(row, path)).resolves.toEqual(row);
+      expect(attempts).toEqual([path, directory]);
+      expect(await readReceipts(path)).toEqual([row]);
+    },
+  );
+
+  it("rejects when the receipt destination cannot be written", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-write-failure-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "receipts.jsonl");
+    await mkdir(path);
+    await expect(
+      appendReceipt(
+        {
+          id: "unwritten",
+          timestamp: "2026-09-10T08:00:00.000Z",
+          resourceUrl: "https://api.example/paid",
+        },
+        path,
+      ),
+    ).rejects.toMatchObject({ code: "EISDIR" });
+    expect(await readdir(path)).toEqual([]);
+  });
+
+  it("syncs the rename temporary file before replacement and the directory afterward", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-rename-sync-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "receipts.jsonl");
+    const receipt: Receipt = {
+      id: "rename",
+      timestamp: "2026-09-10T08:00:00.000Z",
+      resourceUrl: "https://api.example/paid",
+      wallet: "main",
+    };
+    await appendReceipt(receipt, path);
+    const synced: string[] = [];
+    __setReceiptTestHooks({
+      afterSync: async (target) => {
+        synced.push(target);
+        expect((await readReceipts(path))[0]?.wallet).toBe(
+          target === directory ? "renamed" : "main",
+        );
+      },
+    });
+    expect(await renameReceiptWallet("main", "renamed", path)).toBe(1);
+    expect(synced).toEqual([expect.stringMatching(/\.tmp$/), directory]);
+    const before = await readFile(path);
+    const attempts: string[] = [];
+    __setReceiptTestHooks({
+      beforeSync: (target) => {
+        attempts.push(target);
+        throw new Error("sync failed");
+      },
+    });
+    await expect(renameReceiptWallet("renamed", "other", path)).rejects.toThrow("sync failed");
+    expect(attempts).toEqual([expect.stringMatching(/\.tmp$/)]);
+    expect(await readFile(path)).toEqual(before);
+    expect(await readdir(directory)).toEqual(["receipts.jsonl"]);
+    expect((await readReceipts(path))[0]?.wallet).toBe("renamed");
+  });
+
+  it("coalesces Router revisions at the original position before wallet filtering", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-revisions-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "receipts.jsonl");
+    const original: Receipt = {
+      id: "purchase",
+      timestamp: "2026-09-10T08:00:00.000Z",
+      resourceUrl: "https://api.example/top-up/5",
+      source: "router.topup",
+      wallet: "main",
+      settlement: { outcome: "unknown" },
+    };
+    const ordinary: Receipt = { ...original, id: "ordinary", source: "other" };
+    const revision: Receipt = {
+      ...original,
+      wallet: "research",
+      settlement: { outcome: "succeeded" },
+    };
+    for (const row of [original, ordinary, revision, ordinary]) await appendReceipt(row, path);
+    expect(await readReceipts(path)).toEqual([revision, ordinary, ordinary]);
+    expect(await readReceipts(path, { wallet: "main" })).toEqual([ordinary, ordinary]);
+    expect(await readReceipts(path, { wallet: "research" })).toEqual([revision]);
+    expect((await readFile(path, "utf8")).trim().split("\n")).toHaveLength(4);
+  });
+
   it("appends one JSON object per line and reads the newest limit", async () => {
     const directory = await mkdtemp(join(tmpdir(), "vapi-receipts-"));
     temporaryDirectories.push(directory);

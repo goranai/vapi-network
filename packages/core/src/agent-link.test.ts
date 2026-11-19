@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +24,7 @@ import {
   type DeviceLinkStart,
   type LinkResult,
 } from "./agent-link.js";
+import { FileLockedError, __setAtomicFileTestHooks } from "./atomic-file.js";
 import { readAuditLog } from "./audit.js";
 import { DEFAULT_SPEND_CAPS } from "./config.js";
 import type { SecretStore } from "./secret-store.js";
@@ -40,6 +41,8 @@ const ROUTER_KEY = "router-key-that-must-stay-secret";
 const directories: string[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
+  __setAtomicFileTestHooks(undefined);
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -965,6 +968,175 @@ describe("agentAccessToken", () => {
     });
   });
 
+  it.each([
+    "cleared",
+    "relinked",
+    "different-client",
+    "tokens-missing",
+    "refresh-changed",
+    "access-changed",
+  ] as const)(
+    "does not store a refresh response when its link was %s in flight",
+    async (change) => {
+      const home = await temporaryHome();
+      const wallets = await walletStore(home);
+      const link = agentLink();
+      await wallets.setLink("main", link);
+      const accounts = agentSecretAccounts("main");
+      const originalTokens = JSON.stringify({ ...linkResult().tokens, expiresAt: 0 });
+      const secrets = memorySecretStore({ [accounts.tokens]: originalTokens });
+      let reached!: () => void;
+      const started = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      let finish!: (response: Response) => void;
+      const response = new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
+      const fetchImpl = vi.fn<typeof fetch>(async () => {
+        reached();
+        return await response;
+      });
+      const refresh = agentAccessToken({
+        secrets,
+        wallets,
+        wallet: "main",
+        fetchImpl,
+        now: () => 1_000,
+      });
+      const rejected = expect(refresh).rejects.toMatchObject({
+        code: "not_linked",
+        message: "Run vapi login first.",
+      });
+      await started;
+      const competing = await WalletStore.open(home);
+      const replacementTokens = JSON.stringify({
+        ...linkResult().tokens,
+        accessToken: change === "refresh-changed" ? ACCESS_TOKEN : "replacement-access",
+        refreshToken: change === "access-changed" ? REFRESH_TOKEN : "replacement-refresh",
+      });
+      if (change === "cleared") {
+        await competing.clearLink("main");
+        await secrets.remove(accounts.tokens);
+      } else if (change === "tokens-missing") {
+        await secrets.remove(accounts.tokens);
+      } else {
+        await secrets.set(accounts.tokens, replacementTokens);
+        if (change === "relinked" || change === "different-client")
+          await competing.setLink("main", {
+            ...link,
+            ...(change === "relinked"
+              ? { linkedAt: "2026-09-23T11:00:00.000Z" }
+              : { clientId: "different-client" }),
+          });
+      }
+      const writesBeforeResponse = [...secrets.setCalls];
+      finish(
+        Response.json({
+          access_token: "new-access",
+          refresh_token: "new-refresh",
+          expires_in: 3600,
+        }),
+      );
+      await rejected;
+      expect(secrets.setCalls).toEqual(writesBeforeResponse);
+      expect(secrets.entries[accounts.tokens]).toBe(
+        change === "cleared" || change === "tokens-missing" ? undefined : replacementTokens,
+      );
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["same-client", "different-client"] as const)(
+    "stores a valid rotation when login publishes its link after its tokens (%s)",
+    async (client) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-09-23T11:00:00.000Z"));
+      const home = await temporaryHome();
+      const wallets = await walletStore(home);
+      const previousLink = agentLink();
+      await wallets.setLink("main", previousLink);
+      const accounts = agentSecretAccounts("main");
+      const secrets = memorySecretStore({
+        [accounts.tokens]: JSON.stringify({ ...linkResult().tokens, expiresAt: 0 }),
+      });
+      const competing = await WalletStore.open(home);
+      const setLink = competing.setLink.bind(competing);
+      let published!: () => void;
+      const tokensPublished = new Promise<void>((resolve) => {
+        published = resolve;
+      });
+      let finishLogin!: () => void;
+      const writeLink = new Promise<void>((resolve) => {
+        finishLogin = resolve;
+      });
+      vi.spyOn(competing, "setLink").mockImplementation(async (...args) => {
+        published();
+        await writeLink;
+        return await setLink(...args);
+      });
+      const login = saveAgentLink({
+        secrets,
+        wallets: competing,
+        wallet: "main",
+        start: deviceStart({
+          clientId: client === "same-client" ? previousLink.clientId : "new-client",
+        }),
+        result: linkResult({
+          tokens: {
+            ...linkResult().tokens,
+            accessToken: "login-access",
+            refreshToken: "login-refresh",
+            expiresAt: 0,
+          },
+        }),
+        apiBase: API_BASE,
+        label: "relinked",
+        home,
+      });
+      await tokensPublished;
+      let requested!: () => void;
+      const requestStarted = new Promise<void>((resolve) => {
+        requested = resolve;
+      });
+      let respond!: (response: Response) => void;
+      const response = new Promise<Response>((resolve) => {
+        respond = resolve;
+      });
+      const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+        const body = new URLSearchParams(String(init?.body));
+        expect(body.get("refresh_token")).toBe("login-refresh");
+        requested();
+        return await response;
+      });
+      const refresh = agentAccessToken({
+        secrets,
+        wallets,
+        wallet: "main",
+        fetchImpl,
+        now: () => 1_000,
+      });
+      const resolved = expect(refresh).resolves.toBe("rotated-access");
+      await requestStarted;
+      finishLogin();
+      const newLink = await login;
+      expect(newLink.linkedAt).not.toBe(previousLink.linkedAt);
+      respond(
+        Response.json({
+          access_token: "rotated-access",
+          refresh_token: "rotated-refresh",
+          expires_in: 3600,
+        }),
+      );
+      await resolved;
+      expect(JSON.parse(secrets.entries[accounts.tokens]!)).toMatchObject({
+        accessToken: "rotated-access",
+        refreshToken: "rotated-refresh",
+      });
+      expect(secrets.setCalls.filter(([name]) => name === accounts.tokens)).toHaveLength(2);
+    },
+  );
+
   it("reports not_linked when the refresh token was revoked", async () => {
     const home = await temporaryHome();
     const wallets = await walletStore(home);
@@ -1238,6 +1410,221 @@ describe("agentFetch", () => {
 });
 
 describe("forgetAgentLink", () => {
+  it("waits for another refresh past the revocation deadline before removing all credentials", async () => {
+    const home = await temporaryHome();
+    const wallets = await walletStore(home);
+    await wallets.setLink("main", agentLink());
+    const accounts = agentSecretAccounts("main");
+    const secrets = memorySecretStore({
+      [accounts.tokens]: JSON.stringify({ ...linkResult().tokens, expiresAt: 0 }),
+      [accounts.routerStake]: ROUTER_KEY,
+      [accounts.routerBalance]: "balance-router-key",
+    });
+    let started!: () => void;
+    const refreshing = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finish!: (response: Response) => void;
+    const response = new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      expect(new URL(String(input)).pathname).toBe("/oauth/token");
+      started();
+      return await response;
+    });
+    const refresh = agentAccessToken({
+      secrets,
+      wallets,
+      wallet: "main",
+      fetchImpl,
+      now: () => 1_000,
+    });
+    await refreshing;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let waiting!: () => void;
+    const lockWait = new Promise<void>((resolve) => {
+      waiting = resolve;
+    });
+    let retrying!: () => void;
+    const lockRetry = new Promise<"retry">((resolve) => {
+      retrying = () => resolve("retry");
+    });
+    let removing!: () => void;
+    const cleanup = new Promise<"cleanup">((resolve) => {
+      removing = () => resolve("cleanup");
+    });
+    const remove = secrets.remove.bind(secrets);
+    secrets.remove = async (name) => {
+      removing();
+      return await remove(name);
+    };
+    let waits = 0;
+    const schedule = setTimeout;
+    const timerSpy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation((callback, delay, ...args) => {
+        if (delay === 20) {
+          waits += 1;
+          if (waits === 1) waiting();
+          if (waits === 2) retrying();
+        }
+        return schedule(callback, delay, ...args);
+      });
+    let completed = false;
+    const logout = forgetAgentLink({
+      secrets,
+      wallets,
+      wallet: "main",
+      fetchImpl,
+      revocationTimeoutMs: 10,
+    }).then(() => {
+      completed = true;
+    });
+    try {
+      await lockWait;
+      await vi.advanceTimersByTimeAsync(10);
+      expect(completed).toBe(false);
+      expect(secrets.removeCalls).toEqual([]);
+      expect(wallets.entry("main")?.link).toBeDefined();
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(Promise.race([lockRetry, cleanup])).resolves.toBe("retry");
+      finish(
+        Response.json({
+          access_token: "rotated-access",
+          refresh_token: "rotated-refresh",
+          expires_in: 3600,
+        }),
+      );
+      await expect(refresh).resolves.toBe("rotated-access");
+      await vi.waitFor(() => expect(completed).toBe(true), { interval: 1 });
+      await logout;
+      expect(secrets.setCalls).toHaveLength(1);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(secrets.entries).toEqual({});
+      expect((await WalletStore.open(home)).entry("main")?.link).toBeUndefined();
+      expect(await readAuditLog(home)).toEqual([
+        expect.objectContaining({ event: "agent.unlinked" }),
+      ]);
+    } finally {
+      finish(Response.json({ access_token: "rotated-access", expires_in: 3600 }));
+      await refresh.catch(() => undefined);
+      await vi.waitFor(() => expect(completed).toBe(true), { interval: 1 });
+      await logout;
+      timerSpy.mockRestore();
+    }
+  });
+
+  it("finishes an in-flight token write before timeout cleanup so credentials cannot reappear", async () => {
+    const home = await temporaryHome();
+    const wallets = await walletStore(home);
+    await wallets.setLink("main", agentLink());
+    const accounts = agentSecretAccounts("main");
+    const secrets = memorySecretStore({
+      [accounts.tokens]: JSON.stringify({
+        ...linkResult().tokens,
+        expiresAt: Number.MAX_SAFE_INTEGER,
+      }),
+      [accounts.routerStake]: ROUTER_KEY,
+    });
+    let started!: () => void;
+    let finish!: () => void;
+    const writing = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const set = secrets.set.bind(secrets);
+    secrets.set = async (name, value) => {
+      started();
+      await release;
+      await set(name, value);
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const fetchImpl: typeof fetch = async (input) => {
+      if (new URL(String(input)).pathname === "/api/agents/self")
+        return new Response(null, { status: 401 });
+      return Response.json({ access_token: "rotated-access", expires_in: 3600 });
+    };
+    let completed = false;
+    const logout = forgetAgentLink({
+      secrets,
+      wallets,
+      wallet: "main",
+      fetchImpl,
+      revocationTimeoutMs: 10,
+    }).then(() => {
+      completed = true;
+    });
+    await writing;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(completed).toBe(false);
+    finish();
+    await logout;
+    expect(secrets.entries).toEqual({});
+    expect((await WalletStore.open(home)).entry("main")?.link).toBeUndefined();
+    expect(await readAuditLog(home)).toEqual([
+      expect.objectContaining({ event: "agent.unlinked" }),
+    ]);
+  });
+
+  it.each(["delete", "refresh", "refresh-body"] as const)(
+    "bounds stalled %s with one deadline and completes local logout",
+    async (stage) => {
+      const home = await temporaryHome();
+      const wallets = await walletStore(home);
+      await wallets.setLink("main", agentLink());
+      const accounts = agentSecretAccounts("main");
+      const secrets = memorySecretStore({
+        [accounts.tokens]: JSON.stringify({
+          ...linkResult().tokens,
+          expiresAt: Number.MAX_SAFE_INTEGER,
+        }),
+        [accounts.routerStake]: ROUTER_KEY,
+        [accounts.routerBalance]: "balance-router-key",
+      });
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      let reached!: () => void;
+      const stalled = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const signals: AbortSignal[] = [];
+      const fetchImpl: typeof fetch = async (input, init) => {
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        signals.push(init!.signal!);
+        if (stage !== "delete" && new URL(String(input)).pathname === "/api/agents/self") {
+          await vi.advanceTimersByTimeAsync(6);
+          return new Response(null, { status: 401 });
+        }
+        reached();
+        if (stage === "refresh-body") {
+          return new Response(new ReadableStream({ start() {} }));
+        }
+        return await new Promise<Response>(() => undefined);
+      };
+      const logout = forgetAgentLink({
+        secrets,
+        wallets,
+        wallet: "main",
+        fetchImpl,
+        home,
+        revocationTimeoutMs: 10,
+      });
+      await stalled;
+      await vi.advanceTimersByTimeAsync(stage === "delete" ? 10 : 4);
+      await expect(logout).resolves.toBeUndefined();
+      expect(signals.every((signal) => signal === signals[0] && signal.aborted)).toBe(true);
+      expect(secrets.entries).toEqual({});
+      expect((await WalletStore.open(home)).entry("main")?.link).toBeUndefined();
+      expect(await readAuditLog(home)).toEqual([
+        expect.objectContaining({ event: "agent.unlinked", wallet: "main", owner: OWNER }),
+      ]);
+      // The purchase lock is released even when the injected transport ignores abort.
+      await expect(wallets.withRouterPurchaseLock("main", async () => true)).resolves.toBe(true);
+    },
+  );
+
   it("clears local state and audits the unlink even when the remote DELETE fails", async () => {
     const home = await temporaryHome();
     const wallets = await walletStore(home);
@@ -1283,4 +1670,111 @@ describe("forgetAgentLink", () => {
       forgetAgentLink({ secrets, wallets, wallet: "main", fetchImpl, home }),
     ).resolves.toBeUndefined();
   });
+});
+
+describe("agent link purchase serialization", () => {
+  it.each(["login", "logout"] as const)(
+    "%s reports a busy purchase without changing credentials",
+    async (action) => {
+      const home = await temporaryHome();
+      const wallets = await walletStore(home);
+      await wallets.setLink("main", agentLink());
+      const secrets = memorySecretStore();
+      const fetchImpl = vi.fn<typeof fetch>();
+      const lock = vi
+        .spyOn(wallets, "withRouterPurchaseLock")
+        .mockRejectedValue(new FileLockedError());
+      const operation =
+        action === "login"
+          ? saveAgentLink({
+              secrets,
+              wallets,
+              wallet: "main",
+              start: deviceStart(),
+              result: linkResult(),
+              apiBase: API_BASE,
+              label: "new",
+            })
+          : forgetAgentLink({ secrets, wallets, wallet: "main", fetchImpl });
+      await expect(operation).rejects.toThrow(
+        "A Router purchase is in progress. Retry login or logout after it completes.",
+      );
+      expect(secrets.setCalls).toHaveLength(0);
+      expect(secrets.removeCalls).toHaveLength(0);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(wallets.entry("main")?.link).toEqual(agentLink());
+      lock.mockRestore();
+    },
+  );
+
+  it.each(["login", "logout"] as const)(
+    "%s waits outside credential locks without changing state",
+    async (action) => {
+      const home = await temporaryHome();
+      const wallets = await walletStore(home);
+      const originalLink = agentLink();
+      await wallets.setLink("main", originalLink);
+      const accounts = agentSecretAccounts("main");
+      const secrets = memorySecretStore({
+        [accounts.tokens]: JSON.stringify({
+          ...linkResult().tokens,
+          expiresAt: Number.MAX_SAFE_INTEGER,
+        }),
+        [accounts.routerStake]: ROUTER_KEY,
+      });
+      const before = { ...secrets.entries };
+      const fetchImpl = vi.fn<typeof fetch>(async () => new Response(null, { status: 204 }));
+      let release!: () => void;
+      let locked!: () => void;
+      const acquired = new Promise<void>((resolve) => {
+        locked = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const holder = wallets.withRouterPurchaseLock("main", async () => {
+        locked();
+        await gate;
+      });
+      await acquired;
+      let attempting!: () => void;
+      const attempt = new Promise<void>((resolve) => {
+        attempting = resolve;
+      });
+      let registryAttempts = 0;
+      __setAtomicFileTestHooks({
+        beforeLockAttempt: (path) => {
+          if (path.endsWith(".purchase.lock")) attempting();
+          else registryAttempts++;
+        },
+      });
+      const operation =
+        action === "login"
+          ? saveAgentLink({
+              secrets,
+              wallets,
+              wallet: "main",
+              start: deviceStart({ clientId: "new-client" }),
+              result: linkResult(),
+              apiBase: API_BASE,
+              label: "new",
+            })
+          : forgetAgentLink({ secrets, wallets, wallet: "main", fetchImpl });
+      try {
+        await attempt;
+        expect(secrets.entries).toEqual(before);
+        expect(wallets.entry("main")?.link).toEqual(originalLink);
+        expect(fetchImpl).not.toHaveBeenCalled();
+        expect(registryAttempts).toBe(0);
+        expect((await readdir(home)).some((path) => path.endsWith(".agent-link.lock"))).toBe(false);
+      } finally {
+        __setAtomicFileTestHooks(undefined);
+        release();
+        await holder;
+      }
+      await operation;
+      if (action === "login") expect(wallets.entry("main")?.link?.clientId).toBe("new-client");
+      else expect(wallets.entry("main")?.link).toBeUndefined();
+    },
+  );
 });

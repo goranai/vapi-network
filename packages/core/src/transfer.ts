@@ -9,7 +9,7 @@ import { z } from "zod";
 import { AgentLinkError, agentFetch, withAgentCredentialLock } from "./agent-link.js";
 import { getVapiPaths } from "./config.js";
 import { explorerTransactionUrl } from "./networks.js";
-import { appendReceipt, readReceipts, type Receipt } from "./receipts.js";
+import { appendReceipt, readReceipts, syncReceipts, type Receipt } from "./receipts.js";
 import type { SecretStore } from "./secret-store.js";
 import { fetchSiblings, SiblingsError, type Sibling } from "./siblings.js";
 import { releaseSpend, reserveSpend, SpendCapError } from "./spend-policy.js";
@@ -360,6 +360,29 @@ export async function transferBetweenAccounts(args: TransferArgs): Promise<Trans
         replayed: false,
         reservedOn,
       });
+      try {
+        await syncReceipts(context.receiptsPath);
+      } catch (error) {
+        try {
+          await appendTransferReceipt(context, request, {
+            receiptId,
+            status: "failed",
+            txHash: null,
+            replayed: false,
+            reservedOn,
+            error: transferError("network_error"),
+          });
+        } catch {
+          authorizationPersisted = true;
+          return transferResult(context, {
+            status: "unknown",
+            txHash: null,
+            nonce: request.authorization.nonce,
+            replayed: false,
+          });
+        }
+        throw error;
+      }
       authorizationPersisted = true;
       args.signal?.throwIfAborted();
       return await postRelay(context, request, { receiptId, reservedOn, resumed: false });

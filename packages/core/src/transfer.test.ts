@@ -9,7 +9,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { agentSecretAccounts } from "./agent-link.js";
 import { readAuditLog } from "./audit.js";
 import { getVapiPaths, type SpendCaps } from "./config.js";
-import { readReceipts } from "./receipts.js";
+import { __setReceiptTestHooks, readReceipts } from "./receipts.js";
 import type { SecretStore } from "./secret-store.js";
 import { readSpendLedger, reserveSpend } from "./spend-policy.js";
 import {
@@ -69,6 +69,7 @@ type TestFixture = {
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  __setReceiptTestHooks(undefined);
   vi.restoreAllMocks();
   await Promise.all(
     temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
@@ -200,6 +201,128 @@ describe("transferBetweenAccounts", () => {
       transfer: { status: "sent", replayed: true, txHash: TX_HASH },
       settlement: { outcome: "succeeded", transaction: TX_HASH },
     });
+  });
+
+  it("returns sent evidence after a successful relay when the terminal receipt sync fails", async () => {
+    const fixture = await linkedFixture();
+    const path = getVapiPaths(fixture.home).receipts;
+    let terminalSyncs = 0;
+    const transport = fakeTransport(fixture, {
+      relay: async (body) => {
+        __setReceiptTestHooks({
+          beforeSync: (target) => {
+            if (target === path) {
+              terminalSyncs += 1;
+              throw new Error("terminal receipt sync failed");
+            }
+          },
+        });
+        return successfulRelay(body);
+      },
+    });
+
+    await expect(runTransfer(fixture, transport.fetchImpl)).resolves.toMatchObject({
+      status: "sent",
+      txHash: TX_HASH,
+      nonce: NONCE,
+    });
+    expect(terminalSyncs).toBe(1);
+    expect(relayCalls(transport.calls)).toHaveLength(1);
+    expect(await readReceipts(path)).toMatchObject([
+      { transfer: { status: "sent", txHash: TX_HASH, nonce: NONCE } },
+    ]);
+  });
+
+  it.each(["file", "directory"] as const)(
+    "does not relay and records failure when the authorization %s sync fails",
+    async (target) => {
+      const fixture = await linkedFixture();
+      const paths = getVapiPaths(fixture.home);
+      const transport = fakeTransport(fixture);
+      const release = vi.spyOn(await import("./spend-policy.js"), "releaseSpend");
+      __setReceiptTestHooks({
+        beforeSync: (path) => {
+          if (path === (target === "file" ? paths.receipts : fixture.home)) {
+            throw new Error("authorization sync failed");
+          }
+        },
+      });
+
+      await expect(runTransfer(fixture, transport.fetchImpl)).rejects.toMatchObject({
+        name: "TransferError",
+        code: "network_error",
+        message: expect.stringContaining("No money moved."),
+        moneyMoved: false,
+        reservationReleased: true,
+      });
+      expect(relayCalls(transport.calls)).toHaveLength(0);
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(await readSpendLedger(paths.ledger, new Date(NOW_MS), "research")).toMatchObject({
+        spentAtomic: "0",
+      });
+      const rows = (await readFile(paths.receipts, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(rows.map((row) => row.transfer.status)).toEqual(["unknown", "failed"]);
+      expect(rows.at(-1).transfer.nonce).toBe(NONCE);
+      expect(rows.at(-1).transfer.request).toBeUndefined();
+    },
+  );
+
+  it("keeps the reservation and resumes when authorization sync and the failed append both fail", async () => {
+    const fixture = await linkedFixture();
+    const paths = getVapiPaths(fixture.home);
+    const transport = fakeTransport(fixture);
+    const receipts = await import("./receipts.js");
+    const appendReceipt = receipts.appendReceipt;
+    const append = vi
+      .spyOn(receipts, "appendReceipt")
+      .mockImplementationOnce(appendReceipt)
+      .mockRejectedValueOnce(new Error("failed row could not be appended"));
+    const release = vi.spyOn(await import("./spend-policy.js"), "releaseSpend");
+    __setReceiptTestHooks({
+      beforeSync: (path) => {
+        if (path === paths.receipts)
+          throw new TransferError("network_error", "Original durability failure. No money moved.");
+      },
+    });
+
+    const unknown = await runTransfer(fixture, transport.fetchImpl);
+    expect(unknown).toMatchObject({
+      status: "unknown",
+      nonce: NONCE,
+      txHash: null,
+      replayed: false,
+    });
+    expect(append).toHaveBeenCalledTimes(2);
+    expect(release).not.toHaveBeenCalled();
+    expect(relayCalls(transport.calls)).toHaveLength(0);
+    const ledger = JSON.parse(await readFile(paths.ledger, "utf8"));
+    expect(ledger).toMatchObject({
+      rows: [
+        {
+          wallet: "research",
+          spentAtomic: "2000000",
+          reservations: [{ id: NONCE, amountAtomic: "2000000" }],
+        },
+      ],
+    });
+    expect(await readReceipts(paths.receipts)).toMatchObject([
+      { transfer: { status: "unknown", nonce: NONCE, request: expect.any(Object) } },
+    ]);
+
+    __setReceiptTestHooks(undefined);
+    append.mockRestore();
+    const sent = await runTransfer(fixture, transport.fetchImpl, { resume: unknown.nonce });
+    expect(sent).toMatchObject({ status: "sent", nonce: NONCE, txHash: TX_HASH });
+    expect(relayCalls(transport.calls)).toHaveLength(1);
+    expect(fixture.signTypedData).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
+    expect(JSON.parse(await readFile(paths.ledger, "utf8"))).toEqual(ledger);
+    const rows = await readReceipts(paths.receipts);
+    expect(rows.map((row) => row.transfer?.status)).toEqual(["unknown", "sent"]);
+    expect(rows[1]!.transfer?.request).toBeUndefined();
   });
 
   it("5. refuses a revoked sibling before signing", async () => {
